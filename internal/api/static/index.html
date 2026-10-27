@@ -88,6 +88,8 @@
 <body>
 <header>
   <b>🗂 u-file</b><span class="tag">PoC</span><span class="sub">统一文件管理服务平台</span>
+  <button id="btnImport">导入配置</button>
+  <button id="btnExport">导出配置</button>
   <button id="btnAdd">＋ 新增文件源</button>
 </header>
 <main>
@@ -116,6 +118,44 @@
       <button id="pvClose" title="关闭">✕</button>
     </div>
     <div class="pv-body" id="pvBody"></div>
+  </div>
+</div>
+
+<!-- 导出配置 -->
+<div class="overlay" id="dlgExport">
+  <div class="dialog">
+    <h3>导出文件源配置</h3>
+    <label style="display:flex;gap:6px;align-items:center;color:var(--ink)">
+      <input type="checkbox" id="expRedact" style="width:auto"> 脱敏导出（凭据替换为 ******，可作为模板分享/入库）
+    </label>
+    <div class="hint" id="expWarn">⚠ 未脱敏导出包含<b>明文凭据</b>，请妥善保管导出文件，勿提交到版本库或发给他人。</div>
+    <div class="btns">
+      <span id="expMsg" class="hint" style="margin:0"></span>
+      <span class="spacer"></span>
+      <button class="btn plain" id="btnExpCopy">复制 JSON</button>
+      <button class="btn primary" id="btnExpDownload">下载 JSON</button>
+    </div>
+  </div>
+</div>
+
+<!-- 导入配置 -->
+<div class="overlay" id="dlgImport">
+  <div class="dialog">
+    <h3>导入文件源配置</h3>
+    <label>选择导出文件（ufile-sources-*.json）</label>
+    <input type="file" id="impFile" accept=".json,application/json">
+    <div class="hint" style="text-align:center;margin:2px 0">—— 或直接粘贴 JSON ——</div>
+    <textarea id="impText" rows="7" placeholder='支持两种格式：完整导出文件（{"version":1,...}）或源数组（[{"id":...,"type":...,"config":{...}}]）'></textarea>
+    <label style="display:flex;gap:6px;align-items:center;margin-top:10px;color:var(--ink)">
+      <input type="checkbox" id="impOverwrite" style="width:auto"> 覆盖同 ID 的已有源（不勾则跳过）
+    </label>
+    <div class="btns">
+      <span id="impMsg"></span>
+      <span class="spacer"></span>
+      <button class="btn plain" id="btnImpCancel">取消</button>
+      <button class="btn primary" id="btnImpRun">开始导入</button>
+    </div>
+    <div id="impReport" style="display:none;margin-top:10px;max-height:180px;overflow:auto;font-size:12.5px"></div>
   </div>
 </div>
 
@@ -297,6 +337,71 @@ $('btnSave').onclick = async () => {
     await renderSources();
     nav(id, '');   // 保存后直接进入新源
   } catch (e) { alert('保存失败：' + e.message); }
+};
+
+/* ---------- 配置导出 / 导入 ---------- */
+
+$('btnExport').onclick = () => {
+  $('expMsg').textContent = '';
+  $('dlgExport').classList.add('open');
+  syncExpWarn();
+};
+$('expRedact').onchange = syncExpWarn;
+function syncExpWarn() {
+  $('expWarn').style.display = $('expRedact').checked ? 'none' : 'block';
+}
+$('btnExpDownload').onclick = () => {
+  const a = document.createElement('a');
+  a.href = '/api/v1/sources/export' + ($('expRedact').checked ? '?redact=1' : '');
+  a.download = '';
+  a.click();
+  $('expMsg').textContent = '已开始下载。';
+};
+$('btnExpCopy').onclick = async () => {
+  try {
+    const res = await fetch('/api/v1/sources/export' + ($('expRedact').checked ? '?redact=1' : ''));
+    const text = await res.text();
+    await navigator.clipboard.writeText(text);
+    $('expMsg').textContent = '已复制到剪贴板。';
+  } catch (e) { $('expMsg').textContent = '复制失败：' + e.message; }
+};
+// 弹窗点击遮罩关闭（导出）
+$('dlgExport').onclick = ev => { if (ev.target === $('dlgExport')) $('dlgExport').classList.remove('open'); };
+
+$('btnImport').onclick = () => {
+  $('impText').value = ''; $('impFile').value = '';
+  $('impMsg').textContent = ''; $('impReport').style.display = 'none';
+  $('dlgImport').classList.add('open');
+};
+$('btnImpCancel').onclick = () => $('dlgImport').classList.remove('open');
+$('dlgImport').onclick = ev => { if (ev.target === $('dlgImport')) $('dlgImport').classList.remove('open'); };
+$('impFile').onchange = () => {
+  const f = $('impFile').files[0];
+  if (!f) return;
+  const r = new FileReader();
+  r.onload = () => { $('impText').value = r.result; };  // 统一走文本通道，便于预览
+  r.readAsText(f);
+};
+$('btnImpRun').onclick = async () => {
+  const text = $('impText').value.trim();
+  if (!text) { $('impMsg').textContent = '请选择文件或粘贴 JSON'; return; }
+  $('impMsg').textContent = '导入中……';
+  $('impReport').style.display = 'none';
+  try {
+    const rep = await api('POST', '/api/v1/sources/import', {
+      content: text,           // 后端按 RawMessage 原样解析，兼容文件/数组两种格式
+      overwrite: $('impOverwrite').checked,
+    });
+    await renderSources();
+    if (source && !sources.find(x => x.id === source)) { source = ''; path = ''; await render(); }
+    $('impMsg').textContent = `完成：新增 ${rep.added}，更新 ${rep.updated}，跳过 ${rep.skipped}，失败 ${rep.failed}`;
+    const el = $('impReport');
+    el.innerHTML = rep.items.map(i =>
+      `<div>${i.status === 'added' ? '✅' : i.status === 'updated' ? '🔄' : i.status === 'skipped' ? '⏭' : '❌'} ` +
+      `<b>${esc(i.id)}</b> ${i.status === 'added' ? '已新增' : i.status === 'updated' ? '已覆盖更新' : i.status === 'skipped' ? '已跳过' : '失败：' + esc(i.error || '')}</div>`
+    ).join('') + (rep.redacted_count ? `<div class="muted">⚠ 其中 ${rep.redacted_count} 条含脱敏凭据（******），连接测试会失败，请编辑补填真实凭据。</div>` : '');
+    el.style.display = 'block';
+  } catch (e) { $('impMsg').textContent = '导入失败：' + e.message; }
 };
 
 /* ---------- 浏览 ---------- */

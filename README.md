@@ -62,9 +62,13 @@ go test ./...
 | GET | `/api/v1/sources` | 源列表（凭据打码为 `******`） |
 | POST | `/api/v1/sources` | 新增：`{"id","name","type","config"}`，校验通过即时可用 |
 | DELETE | `/api/v1/sources/{id}` | 删除 |
+| GET | `/api/v1/sources/export?redact=1` | 导出全部源配置为 JSON 附件（`redact=1` 凭据打码，默认含明文凭据） |
+| POST | `/api/v1/sources/import` | 导入源配置：`{"content": "<导出 JSON 或 JSON 字符串>", "overwrite": bool}`，逐条报告 added/updated/skipped/failed |
 | POST | `/api/v1/sources/test` | 连接测试（不落盘）：`{"type","config"}` → `{"ok","latency_ms","error"}` |
 
 **持久化规则**：源定义存于 `data/sources.json`；`config.yaml` 仅在首次启动（该文件不存在时）播种导入，之后以页面/API 管理为准，已删除的源不会被配置文件复活。凭据目前明文存于该文件（0600 权限），AES-GCM 加密落库在 M1 完成。
+
+**配置迁移**：页面右上角「导出配置 / 导入配置」可在实例间迁移源定义。导出可选脱敏（凭据替换为 `******`，适合分享/存档）；未脱敏导出含明文凭据，请勿入库或外发。导入兼容完整导出文件与裸数组两种格式，逐条校验并给出 added/updated/skipped/failed 报告；含脱敏凭据的条目导入后需补填真实凭据才能连接。
 
 ## 文件预览
 

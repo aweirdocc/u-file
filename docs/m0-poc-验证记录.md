@@ -98,7 +98,23 @@ Web「＋ 新增文件源」弹窗（类型选择 + 动态字段 + 测试连接 
 
 注：MKV 等依赖浏览器编解码器的格式由前端 fallback 到下载；Office 文档预览（需 mammoth/SheetJS 等前端重依赖）排 M1+。
 
-### 8. 待办（转入 M1）
+### 8. 配置导出 / 导入（2026-10-27 追加）
+
+- 导出：`GET /api/v1/sources/export`（JSON 附件，`?redact=1` 凭据打码；全量导出文件名 `ufile-sources-full.json` 即提示含明文）
+- 导入：`POST /api/v1/sources/import`，兼容完整导出文件 / 裸数组 / 字符串化 JSON 三种载荷；逐条独立处理（单条失败不影响其余），报告 added/updated/skipped/failed；`overwrite` 控制同 ID 覆盖或跳过；识别脱敏凭据并在报告计数提醒补填
+- Web：头部「导出配置」（脱敏开关 + 下载/复制）与「导入配置」（选文件自动读入文本框/直接粘贴 + 覆盖开关 + 逐条结果展示）
+
+| 用例 | 结果 |
+|---|---|
+| 导出全量 200 + attachment 文件名；redact 后凭据为 ****** | ✅ |
+| 导入新增 → added；重复导入不覆盖 → skipped（含提示文案） | ✅ |
+| overwrite=true → updated，名称真实更新 | ✅ |
+| 导出文件原文直接 POST（不经 content 包装）→ 全部 skipped/updated 正确 | ✅ |
+| 脱敏导出再导入 → redacted_count 正确计数 | ✅ |
+| 非法 JSON → 400 IMPORT_FAILED | ✅ |
+| 导入后重启持久化；单测 6 例（往返/覆盖跳过/双格式/脱敏/跨实例） | ✅ |
+
+### 9. 待办（转入 M1）
 
 - 真实云联调：OSS / COS / R2（含 virtual-hosted、aws-chunked 差异）——签名正确性尚未被真实验证
 - 鉴权（JWT）、源管理 API、凭据 AES-GCM 加密落库

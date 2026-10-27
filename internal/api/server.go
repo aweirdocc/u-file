@@ -3,7 +3,9 @@ package api
 import (
 	"context"
 	"embed"
+	"encoding/json"
 	"errors"
+	"io"
 	"mime"
 	"net/http"
 	"path"
@@ -94,6 +96,8 @@ func New(cfgSources *source.Manager) (*Server, error) {
 	grp.GET("/sources/:id", s.getSource)
 	grp.DELETE("/sources/:id", s.removeSource)
 	grp.POST("/sources/test", s.testSource) // 放在 :id 之前注册不冲突；路径字面量优先
+	grp.GET("/sources/export", s.exportSources)
+	grp.POST("/sources/import", s.importSources)
 	grp.GET("/sources/:id/files", s.listFiles)
 	grp.GET("/sources/:id/download", s.download)
 	grp.GET("/sources/:id/raw", s.raw)
@@ -166,6 +170,82 @@ func (s *Server) removeSource(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+// exportSources 导出源配置为 JSON 附件。?redact=1 时凭据打码（模板分享场景），
+// 默认全量（含明文凭据，响应头已标注提示）。
+func (s *Server) exportSources(c *gin.Context) {
+	redact := c.Query("redact") == "1"
+	doc := s.sources.Export(redact)
+	raw, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"code": "EXPORT_FAILED", "message": err.Error()})
+		return
+	}
+	name := "ufile-sources-redacted.json"
+	if !redact {
+		name = "ufile-sources-full.json" // 含明文凭据，文件名本身即提醒
+	}
+	c.Header("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": name}))
+	c.Data(http.StatusOK, "application/json; charset=utf-8", raw)
+}
+
+// importSources 导入源配置。请求体：{"content": "<json 字符串 或 原始导出 JSON>", "overwrite": bool}
+// 也兼容直接 POST 导出文件原文（Content-Type: application/json，body 即文件内容）。
+func (s *Server) importSources(c *gin.Context) {
+	var payload []byte
+	var overwrite bool
+
+	if strings.Contains(c.ContentType(), "multipart/form-data") {
+		fh, err := c.FormFile("file")
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"code": "INVALID_PARAM", "message": "缺少 file 字段"})
+			return
+		}
+		f, err := fh.Open()
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"code": "INVALID_PARAM", "message": err.Error()})
+			return
+		}
+		defer f.Close()
+		buf, err := io.ReadAll(io.LimitReader(f, 10<<20)) // 导入文件上限 10MB
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"code": "INVALID_PARAM", "message": err.Error()})
+			return
+		}
+		payload = buf
+		overwrite = c.PostForm("overwrite") == "true"
+	} else {
+		var req struct {
+			Content   json.RawMessage `json:"content"`
+			Overwrite bool            `json:"overwrite"`
+		}
+		raw, err := c.GetRawData()
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"code": "INVALID_PARAM", "message": err.Error()})
+			return
+		}
+		if err := json.Unmarshal(raw, &req); err == nil && len(req.Content) > 0 {
+			payload = req.Content
+			// 前端以字符串形式传 JSON 文本（{"content":"[{...}]"）→ 解出字符串再当载荷
+			if isJSONString(payload) {
+				var s string
+				if err := json.Unmarshal(payload, &s); err == nil {
+					payload = []byte(s)
+				}
+			}
+			overwrite = req.Overwrite
+		} else {
+			payload = raw // 视为导出文件原文直接导入
+		}
+	}
+
+	rep, err := s.sources.ImportRaw(payload, overwrite)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"code": "IMPORT_FAILED", "message": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, rep)
 }
 
 // —— 浏览 ——
@@ -306,6 +386,17 @@ func (s *Server) presign(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"url": u, "expires_in": int(ttl.Seconds())})
+}
+
+// isJSONString 判断原始 JSON 值是否为字符串字面量（首字符为 "）。
+func isJSONString(b []byte) bool {
+	for _, c := range b {
+		if c == ' ' || c == '\t' || c == '\r' || c == '\n' {
+			continue
+		}
+		return c == '"'
+	}
+	return false
 }
 
 func (s *Server) fail(c *gin.Context, err error) {
