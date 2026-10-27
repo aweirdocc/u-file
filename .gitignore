@@ -15,6 +15,7 @@ config.yaml
 # 前端（M1 起）
 web/node_modules/
 web/dist/
+web/tsconfig.tsbuildinfo
 
 # IDE / 系统
 .idea/
