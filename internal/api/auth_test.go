@@ -26,7 +26,7 @@ func newAuthServer(t *testing.T) (http.Handler, *auth.Store) {
 		t.Fatal(err)
 	}
 	alog, _ := audit.Open(t.TempDir(), nil)
-	srv, err := New(mgr, store, alog, nil)
+	srv, err := New(mgr, store, alog, nil, testWebFS(t))
 	if err != nil {
 		t.Fatal(err)
 	}

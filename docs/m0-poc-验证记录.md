@@ -253,3 +253,58 @@ Web「＋ 新增文件源」弹窗（类型选择 + 动态字段 + 测试连接 
 - SFTP host key 完整 TOFU（known_hosts 持久化）未做，重启后重新首连
 - 大目录体验：搜索依赖同步深度（万级条目目录已同步即可命中）；全文检索/排序在 P3
 - 数据库源（BLOB/GridFS）、分享外链、多用户 ACL、WebDAV 服务端 → M3（P2）
+
+---
+
+## 前端重构验证记录（2026-10-27，Vue 3 + Element Plus）
+
+> 范围：将 963 行单文件原生 JS UI 重构为 Vue 3 + TS + Element Plus + Pinia + Vue Router + Vite 工程（docs/04 既定技术栈落地），产物仍内嵌单二进制。
+
+### 1. 工程结构（web/）
+
+- `.npmrc` 项目级覆盖：registry=npmmirror + 置空代理（本机全局代理 127.0.0.1:7897 已失效，直连正常）
+- Vite：`server.proxy['/api'] → localhost:8080`（开发期同源，cookie SameSite=Lax 正常，后端零 CORS 改动）
+- 分层：`api/`（client 统一 Bearer/401 拦截/X-Auth-Token 捕获 + 类型化调用函数）· `stores/`（auth/browse）· `components/`（13 个组件）· `utils/`（format/preview + Markdown 渲染器迁移）
+- 构建：`vue-tsc -b` 严格模式零错误；vite build 产物 gzip 约 366KB（Element Plus 全量）
+
+### 2. 后端接入
+
+- `web/embed.go`：`//go:embed all:dist`（embed 不能引用包外目录，故放 web/ 内）
+- `api.New` 增加 `webFS fs.FS` 参数；`GET /` 直出 index.html；NoRoute 改造：`/api/*` 保持 JSON 404，
+  其余先试静态文件、miss 回退 index.html（SPA 深层路由刷新不 404）
+- `-web` flag：指向磁盘目录覆盖内嵌产物（前端开发调试逃生口）
+- 旧 `internal/api/static/index.html` 已删除（git 历史可找回）
+
+### 3. 鉴权通道统一（修掉旧版缺陷）
+
+- 全部 XHR 统一走 Bearer 头（旧版 files 列表/export 复制是裸 fetch 隐式依赖 cookie）
+- download/raw/archive 保留 `<a href>` 原生导航（HttpOnly cookie 兜底），与后端双通道设计一致
+- 401 全局拦截 → 自动弹登录框；token 存 sessionStorage
+
+### 4. 顺手修复的旧版缺陷
+
+- 同步状态条 running 轮询叠加（每次 render 新起一条链）→ 单实例轮询 + 源切换作废旧响应
+- 搜索结果复用浏览表头（列语义不匹配）→ 独立 SearchPanel（来源/路径列）
+- 删除当前源/导入后源消失不同步 URL → 统一路由驱动，URL 始终与状态一致
+- 同步失败 `.bad` 无红色样式 → 补齐
+- 全部弹窗支持 Esc 关闭（el-dialog 默认），confirm/prompt/alert 全部升级为 ElMessageBox/ElMessage
+
+### 5. 浏览器端到端实测（Chrome 控件 + 内嵌产物，18096 端口）
+
+| 用例 | 结果 |
+|---|---|
+| 首访弹出「初始化：创建管理员」引导框 | ✅ |
+| 填表创建管理员 → 弹窗关、头部显示 admin（管理员）、admin 按钮组出现 | ✅ |
+| 新增源：类型切换字段组、测试连接 ✓、保存按钮先禁用后启用、保存成功 | ✅ |
+| 源标签点击 → 文件列表（勾选列/预览/下载/重命名）、同步状态条、上传/新建工具栏 | ✅ |
+| Markdown 预览渲染（h1/ul/strong 正确） | ✅ |
+| 新建文件夹 → prompt 确认 → 列表即时刷新（缓存失效链路） | ✅ |
+| 目录进入/返回上级，面包屑两级正确，URL 路由同步 | ✅ |
+| 顶栏搜索回车 → 独立结果表（来源/路径/进入）→ 返回浏览 | ✅ |
+| 勾选 → 「已选 1 项」+ 删除按钮 → 确认框 → 列表与磁盘同步移除 | ✅ |
+
+### 6. 已知边界
+
+- Element Plus 全量引入（bundle 偏大）；按需引入/手动分包留作后续优化
+- 用户管理界面（auth/users API）暂无页面，M3 随多用户 ACL 一起做
+- 文件上传走原生 input multiple（el-upload 手动模式语义等价）；分片上传属 M3+ 传输中心范畴

@@ -30,6 +30,11 @@ go run ./cmd/u-file -config config.yaml
 # 首次访问会引导创建管理员账号；数据（源定义/主密钥/用户/索引/审计）在 ./data，
 # 可用 -data 参数另指定。
 
+# 2b.（前端开发模式）Vue 3 + Element Plus 工程，Vite 热更新 + /api 代理到 8080
+cd web && npm install && npm run dev   # → http://localhost:5173
+# 修改前端后重新构建内嵌产物：
+cd web && npm run build && cd .. && go build -o ufile.exe ./cmd/u-file
+
 # 3.（可选）本地起一个 S3 兼容测试端点，验证 S3 驱动
 go run ./cmd/fakes3 -addr 127.0.0.1:19000 -bucket demo
 # config.yaml 里启用 minio-demo/fakes3 段（endpoint 指向 19000）
@@ -132,4 +137,4 @@ go test ./...
 
 ## 技术栈
 
-Go 1.22+ / Gin · aws-sdk-go-v2（S3 协议族统一接入） · jlaffaye/ftp（FTP/FTPS） · pkg/sftp + x/crypto/ssh（SFTP） · golang.org/x/crypto（bcrypt） · 内嵌单页 Web UI（原生 JS，无构建步骤） · 文件型存储（sources.json / users.json / index.json / audit.log，SQLite 视需求后置）
+Go 1.22+ / Gin · aws-sdk-go-v2（S3 协议族统一接入） · jlaffaye/ftp（FTP/FTPS） · pkg/sftp + x/crypto/ssh（SFTP） · golang.org/x/crypto（bcrypt） · **Web 前端：Vue 3 + TypeScript + Element Plus + Pinia + Vue Router + Vite（`web/` 工程，构建产物 `web/dist` 经 go:embed 内嵌单二进制；开发期 Vite proxy 代理 /api）** · 文件型存储（sources.json / users.json / index.json / audit.log，SQLite 视需求后置）

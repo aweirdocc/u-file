@@ -2,11 +2,11 @@ package api
 
 import (
 	"context"
-	"embed"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"mime"
 	"net/http"
 	"path"
@@ -22,9 +22,6 @@ import (
 	"ufile/internal/index"
 	"ufile/internal/source"
 )
-
-//go:embed static/index.html
-var staticFS embed.FS
 
 // textLikeExtensions 视为文本预览的扩展名（前端按此判断，后端兜底嗅探）。
 var textLikeExtensions = map[string]bool{
@@ -81,18 +78,20 @@ func mediaTypeByExt(name string) string {
 }
 
 type Server struct {
-	engine  *gin.Engine
-	sources *source.Manager
-	auth    *auth.Store
-	audit   *audit.Log
-	index   *index.Cache // 可为 nil（未启用索引缓存）
+	engine    *gin.Engine
+	sources   *source.Manager
+	auth      *auth.Store
+	audit     *audit.Log
+	index     *index.Cache // 可为 nil（未启用索引缓存）
+	webFS     fs.FS        // 前端静态资源（Vue 构建产物）
+	indexHTML []byte       // 入口 index.html（启动时读入）
 }
 
 // New 构造 API 服务。authStore/auditLog 可为 nil（无鉴权模式）；
-// indexCache 可为 nil（未启用索引缓存）。
-func New(cfgSources *source.Manager, authStore *auth.Store, auditLog *audit.Log, indexCache *index.Cache) (*Server, error) {
+// indexCache 可为 nil（未启用索引缓存）；webFS 为前端静态资源（必传）。
+func New(cfgSources *source.Manager, authStore *auth.Store, auditLog *audit.Log, indexCache *index.Cache, webFS fs.FS) (*Server, error) {
 	gin.SetMode(gin.ReleaseMode)
-	s := &Server{engine: gin.New(), sources: cfgSources, auth: authStore, audit: auditLog, index: indexCache}
+	s := &Server{engine: gin.New(), sources: cfgSources, auth: authStore, audit: auditLog, index: indexCache, webFS: webFS}
 	s.engine.Use(gin.Logger(), gin.Recovery())
 
 	s.engine.GET("/healthz", func(c *gin.Context) {
@@ -151,15 +150,35 @@ func New(cfgSources *source.Manager, authStore *auth.Store, auditLog *audit.Log,
 		grp.GET("/index/status", authAny, s.indexStatus)
 	}
 
-	indexHTML, err := staticFS.ReadFile("static/index.html")
-	if err != nil {
-		return nil, err
+	// —— 前端静态资源（Vue 构建产物，web/embed.go 内嵌 dist/）——
+	if s.webFS == nil {
+		return nil, errors.New("api: 前端资源未加载（web/dist 缺失？先执行 cd web && npm run build）")
 	}
+	indexHTML, err := fs.ReadFile(s.webFS, "index.html")
+	if err != nil {
+		return nil, fmt.Errorf("api: 读取前端入口失败: %w", err)
+	}
+	s.indexHTML = indexHTML
+	assetServer := http.FileServer(http.FS(s.webFS))
 	s.engine.GET("/", func(c *gin.Context) {
-		c.Data(http.StatusOK, "text/html; charset=utf-8", indexHTML)
+		c.Data(http.StatusOK, "text/html; charset=utf-8", s.indexHTML)
 	})
+	// SPA fallback：/api/* 保持 JSON 404；其余路径先试静态文件（assets/*），
+	// miss 则回退 index.html（前端路由 /:source/... 刷新不 404）
 	s.engine.NoRoute(func(c *gin.Context) {
-		c.JSON(http.StatusNotFound, gin.H{"code": "NOT_FOUND", "message": "接口不存在"})
+		p := c.Request.URL.Path
+		if strings.HasPrefix(p, "/api/") {
+			c.JSON(http.StatusNotFound, gin.H{"code": "NOT_FOUND", "message": "接口不存在"})
+			return
+		}
+		if p != "/" {
+			if f, err := s.webFS.Open(strings.TrimPrefix(p, "/")); err == nil {
+				f.Close()
+				assetServer.ServeHTTP(c.Writer, c.Request)
+				return
+			}
+		}
+		c.Data(http.StatusOK, "text/html; charset=utf-8", s.indexHTML)
 	})
 	return s, nil
 }

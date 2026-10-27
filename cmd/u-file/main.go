@@ -8,6 +8,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io/fs"
 	"log"
 	"net/http"
 	"os"
@@ -24,6 +25,7 @@ import (
 	"ufile/internal/driver"
 	"ufile/internal/index"
 	"ufile/internal/source"
+	"ufile/web"
 
 	// 统一注册所有内建驱动（init 时写入 driver 注册表）
 	_ "ufile/internal/driver/all"
@@ -56,6 +58,7 @@ func main() {
 	cfgPath := flag.String("config", "config.yaml", "配置文件路径")
 	addr := flag.String("addr", "", "监听地址（覆盖配置文件 server.port），如 :8080")
 	dataDir := flag.String("data", "./data", "数据目录（源定义/主密钥/用户/索引/审计）")
+	webDir := flag.String("web", "", "Web 静态资源目录（默认用内嵌的 web/dist；前端开发时指向 Vite 产物目录）")
 	flag.Parse()
 
 	cfg, err := config.Load(*cfgPath)
@@ -114,7 +117,19 @@ func main() {
 	// 源删除时联动清理索引（复用 Manager 的删除钩子）
 	mgr.OnRemove = idxCache.Forget
 
-	srv, err := api.New(mgr, authStore, auditLog, idxCache)
+	// 前端静态资源：默认内嵌 web/dist；-web 参数可指向磁盘目录（前端开发调试）
+	var webFS fs.FS
+	if *webDir != "" {
+		webFS = os.DirFS(*webDir)
+		log.Printf("前端资源使用磁盘目录: %s", *webDir)
+	} else {
+		webFS, err = web.FS()
+		if err != nil {
+			log.Fatalf("加载内嵌前端资源失败: %v", err)
+		}
+	}
+
+	srv, err := api.New(mgr, authStore, auditLog, idxCache, webFS)
 	if err != nil {
 		log.Fatalf("初始化失败: %v", err)
 	}
