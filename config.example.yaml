@@ -1,0 +1,61 @@
+# u-file M0 PoC 配置示例。复制为 config.yaml 后按需启用。
+# 注意：PoC 阶段凭据明文存放于本文件，仅限本地联调；
+# 生产阶段将改为 Web 录入 + AES-GCM 加密落库（见 docs/04-总体架构设计）。
+server:
+  port: 8080
+
+sources:
+  # 本地磁盘（开箱即用）
+  - id: local-demo
+    name: 本地示例
+    type: local
+    config:
+      root: ./data/files
+
+  # —— MinIO（本地 Docker 联调，见 deploy/docker-compose.dev.yml）——
+  # - id: minio-demo
+  #   name: MinIO 本地
+  #   type: s3
+  #   config:
+  #     endpoint: http://127.0.0.1:9000
+  #     region: us-east-1
+  #     bucket: demo
+  #     access_key: minioadmin
+  #     secret_key: minioadmin
+  #     use_path_style: true
+
+  # —— Cloudflare R2 ——
+  # - id: r2-demo
+  #   name: Cloudflare R2
+  #   type: s3
+  #   config:
+  #     endpoint: https://<ACCOUNT_ID>.r2.cloudflarestorage.com
+  #     region: auto
+  #     bucket: <BUCKET>
+  #     access_key: <ACCESS_KEY_ID>
+  #     secret_key: <SECRET_ACCESS_KEY>
+  #     use_path_style: false    # R2 两种寻址均可
+
+  # —— 阿里云 OSS（S3 兼容端点）——
+  # - id: oss-demo
+  #   name: 阿里云 OSS
+  #   type: s3
+  #   config:
+  #     endpoint: https://s3.oss-cn-hangzhou.aliyuncs.com
+  #     region: cn-hangzhou
+  #     bucket: <BUCKET>
+  #     access_key: <AccessKeyId>
+  #     secret_key: <AccessKeySecret>
+  #     use_path_style: false    # OSS 推荐 virtual-hosted；桶名含下划线时改 true
+
+  # —— 腾讯云 COS（S3 兼容端点；桶名格式 <BucketName-APPID>）——
+  # - id: cos-demo
+  #   name: 腾讯云 COS
+  #   type: s3
+  #   config:
+  #     endpoint: https://cos.ap-guangzhou.myqcloud.com
+  #     region: ap-guangzhou
+  #     bucket: <BUCKET-APPID>
+  #     access_key: <SecretId>
+  #     secret_key: <SecretKey>
+  #     use_path_style: false    # 2024-01-01 后创建的桶不支持 path-style
