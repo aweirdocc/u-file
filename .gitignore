@@ -26,3 +26,6 @@ Thumbs.db
 # 备份/临时文件
 *.exe~
 *.bak
+
+# ZCode 会话本地文件
+.zcode/
