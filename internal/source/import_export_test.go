@@ -13,7 +13,7 @@ func TestExportRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	m, err := NewManager(dir, []Seed{
 		{ID: "s1", Name: "本地", Type: "local", Config: map[string]any{"root": "."}},
-	})
+	}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -57,7 +57,7 @@ func TestExportRoundTrip(t *testing.T) {
 
 func TestImportAddSkipOverwrite(t *testing.T) {
 	dir := t.TempDir()
-	m, err := NewManager(dir, []Seed{{ID: "exist", Name: "旧", Type: "local", Config: map[string]any{"root": "."}}})
+	m, err := NewManager(dir, []Seed{{ID: "exist", Name: "旧", Type: "local", Config: map[string]any{"root": "."}}}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,7 +91,7 @@ func TestImportAddSkipOverwrite(t *testing.T) {
 
 func TestImportRawBothFormats(t *testing.T) {
 	dir := t.TempDir()
-	m, err := NewManager(dir, nil)
+	m, err := NewManager(dir, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -124,7 +124,7 @@ func TestImportRawBothFormats(t *testing.T) {
 
 func TestImportRedactedWarning(t *testing.T) {
 	dir := t.TempDir()
-	m, err := NewManager(dir, nil)
+	m, err := NewManager(dir, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -149,7 +149,7 @@ func TestImportRedactedWarning(t *testing.T) {
 
 func TestExportImportPersistence(t *testing.T) {
 	dir := t.TempDir()
-	m1, err := NewManager(dir, nil)
+	m1, err := NewManager(dir, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -158,7 +158,7 @@ func TestExportImportPersistence(t *testing.T) {
 	}
 	raw, _ := json.Marshal(m1.Export(false))
 	// 另一个实例导入
-	m2, err := NewManager(dir+"/other", nil)
+	m2, err := NewManager(dir+"/other", nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

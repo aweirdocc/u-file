@@ -16,7 +16,7 @@ import (
 
 func newTestManager(t *testing.T, seeds []Seed) *Manager {
 	t.Helper()
-	m, err := NewManager(t.TempDir(), seeds)
+	m, err := NewManager(t.TempDir(), seeds, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -112,7 +112,7 @@ func TestPersistenceAndSeedOnce(t *testing.T) {
 	dir := t.TempDir()
 	seeds := []Seed{seedLocal("seeded")}
 
-	m1, err := NewManager(dir, seeds)
+	m1, err := NewManager(dir, seeds, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,7 +129,7 @@ func TestPersistenceAndSeedOnce(t *testing.T) {
 	}
 
 	// 重启：seed 不再导入（避免复活已删除的源），added 仍在
-	m2, err := NewManager(dir, seeds)
+	m2, err := NewManager(dir, seeds, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -148,7 +148,7 @@ func TestPersistenceAndSeedOnce(t *testing.T) {
 	if err := m2.Remove("seeded"); err != nil {
 		t.Fatal(err)
 	}
-	m3, err := NewManager(dir, seeds)
+	m3, err := NewManager(dir, seeds, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -164,7 +164,7 @@ func TestLoadSkipsBrokenSource(t *testing.T) {
 	if err := os.WriteFile(file, []byte(bad), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	m, err := NewManager(dir, nil)
+	m, err := NewManager(dir, nil, nil)
 	if err != nil {
 		t.Fatalf("单个坏源不应阻断启动: %v", err)
 	}

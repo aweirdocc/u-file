@@ -5,6 +5,7 @@ import (
 	"embed"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"mime"
 	"net/http"
@@ -15,7 +16,10 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"ufile/internal/audit"
+	"ufile/internal/auth"
 	"ufile/internal/driver"
+	"ufile/internal/index"
 	"ufile/internal/source"
 )
 
@@ -79,11 +83,16 @@ func mediaTypeByExt(name string) string {
 type Server struct {
 	engine  *gin.Engine
 	sources *source.Manager
+	auth    *auth.Store
+	audit   *audit.Log
+	index   *index.Cache // 可为 nil（未启用索引缓存）
 }
 
-func New(cfgSources *source.Manager) (*Server, error) {
+// New 构造 API 服务。authStore/auditLog 可为 nil（无鉴权模式）；
+// indexCache 可为 nil（未启用索引缓存）。
+func New(cfgSources *source.Manager, authStore *auth.Store, auditLog *audit.Log, indexCache *index.Cache) (*Server, error) {
 	gin.SetMode(gin.ReleaseMode)
-	s := &Server{engine: gin.New(), sources: cfgSources}
+	s := &Server{engine: gin.New(), sources: cfgSources, auth: authStore, audit: auditLog, index: indexCache}
 	s.engine.Use(gin.Logger(), gin.Recovery())
 
 	s.engine.GET("/healthz", func(c *gin.Context) {
@@ -91,17 +100,44 @@ func New(cfgSources *source.Manager) (*Server, error) {
 	})
 
 	grp := s.engine.Group("/api/v1")
-	grp.GET("/sources", s.listSources)
-	grp.POST("/sources", s.addSource)
-	grp.GET("/sources/:id", s.getSource)
-	grp.DELETE("/sources/:id", s.removeSource)
-	grp.POST("/sources/test", s.testSource) // 放在 :id 之前注册不冲突；路径字面量优先
-	grp.GET("/sources/export", s.exportSources)
-	grp.POST("/sources/import", s.importSources)
-	grp.GET("/sources/:id/files", s.listFiles)
-	grp.GET("/sources/:id/download", s.download)
-	grp.GET("/sources/:id/raw", s.raw)
-	grp.GET("/sources/:id/presign", s.presign)
+
+	// —— 鉴权（无鉴权模式下不注册）——
+	if s.auth != nil {
+		grp.POST("/auth/bootstrap", s.bootstrap) // 仅无用户时可创建首个管理员
+		grp.POST("/auth/login", s.login)
+		grp.GET("/auth/status", s.authStatus) // 前端判断是否需要引导/登录
+		grp.GET("/auth/me", s.requireRole(auth.RoleAdmin, auth.RoleGuest), s.me)
+		grp.POST("/auth/users", s.requireRole(auth.RoleAdmin), s.createUser)
+		grp.GET("/auth/users", s.requireRole(auth.RoleAdmin), s.listUsers)
+		grp.DELETE("/auth/users/:name", s.requireRole(auth.RoleAdmin), s.deleteUser)
+		grp.POST("/auth/users/:name/password", s.requireRole(auth.RoleAdmin), s.resetPassword)
+		grp.POST("/auth/logout", s.requireRole(auth.RoleAdmin, auth.RoleGuest), s.logout)
+	}
+
+	// —— 源管理（admin 专用；guest 只读浏览）——
+	authAdmin := s.requireRole(auth.RoleAdmin)
+	authAny := s.requireRole(auth.RoleAdmin, auth.RoleGuest)
+	grp.GET("/sources", authAny, s.listSources)
+	grp.GET("/sources/:id", authAny, s.getSource)
+	grp.GET("/sources/export", authAdmin, s.exportSources) // 全量导出含明文凭据，admin only
+	grp.POST("/sources/import", authAdmin, s.importSources)
+	grp.POST("/sources/test", authAdmin, s.testSource)
+	grp.POST("/sources", authAdmin, s.addSource)
+	grp.PUT("/sources/:id", authAdmin, s.updateSource)
+	grp.DELETE("/sources/:id", authAdmin, s.removeSource)
+
+	// —— 浏览/下载/预览（guest 可用）——
+	grp.GET("/sources/:id/files", authAny, s.listFiles)
+	grp.GET("/sources/:id/download", authAny, s.download)
+	grp.GET("/sources/:id/raw", authAny, s.raw)
+	grp.GET("/sources/:id/presign", authAny, s.presign)
+
+	// —— 索引/同步状态（M1 索引缓存，index 未启用时不注册）——
+	if s.index != nil {
+		grp.GET("/sources/:id/sync", authAny, s.syncStatus)
+		grp.POST("/sources/:id/sync", authAdmin, s.syncTrigger)
+		grp.GET("/index/status", authAny, s.indexStatus)
+	}
 
 	indexHTML, err := staticFS.ReadFile("static/index.html")
 	if err != nil {
@@ -116,7 +152,226 @@ func New(cfgSources *source.Manager) (*Server, error) {
 	return s, nil
 }
 
+// Handler 返回根 HTTP Handler。
 func (s *Server) Handler() http.Handler { return s.engine }
+
+// requireRole 鉴权中间件。auth 未启用时直接放行（本地联调模式）。
+func (s *Server) requireRole(roles ...auth.Role) gin.HandlerFunc {
+	if s.auth == nil {
+		return func(c *gin.Context) { c.Next() }
+	}
+	return func(c *gin.Context) {
+		tok := bearerToken(c.Request)
+		if tok == "" {
+			c.Header("WWW-Authenticate", `Bearer realm="u-file"`)
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"code": "UNAUTHORIZED", "message": "未登录"})
+			return
+		}
+		cl, err := s.auth.Verify(tok)
+		if err != nil {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"code": "UNAUTHORIZED", "message": "会话已过期，请重新登录"})
+			return
+		}
+		allowed := false
+		for _, r := range roles {
+			if cl.Role == r {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"code": "FORBIDDEN", "message": "权限不足（该操作需管理员）"})
+			return
+		}
+		c.Set("user", cl.Sub)
+		c.Set("role", cl.Role)
+		c.Next()
+	}
+}
+
+func bearerToken(r *http.Request) string {
+	h := r.Header.Get("Authorization")
+	if strings.HasPrefix(h, "Bearer ") {
+		return strings.TrimPrefix(h, "Bearer ")
+	}
+	// 浏览器原生下载/预览标签无法带 header，接受 cookie 中的 token
+	if ck, err := r.Cookie("ufile_token"); err == nil {
+		return ck.Value
+	}
+	// 兜底：?token=（下载/预览直链场景；不推荐，日志里注意不打 URL query）
+	return r.URL.Query().Get("token")
+}
+
+// audit 记录一条审计日志（auth 未启用时为空操作）。
+// overrideUser 供登录/引导等“尚无会话”的动作显式指定操作者。
+func (s *Server) auditAction(c *gin.Context, action string, detail any) {
+	s.auditActionAs(c, action, detail, "")
+}
+
+func (s *Server) auditActionAs(c *gin.Context, action string, detail any, overrideUser string) {
+	if s.audit == nil {
+		return
+	}
+	user, _ := c.Get("user")
+	name := fmt.Sprint(user)
+	if overrideUser != "" {
+		name = overrideUser
+	}
+	s.audit.Record(audit.Entry{
+		Time:   time.Now(),
+		User:   name,
+		IP:     c.ClientIP(),
+		Action: action,
+		Detail: detail,
+	})
+}
+
+// —— 鉴权接口 ——
+
+type bootstrapReq struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+// bootstrap 创建首个管理员：仅当系统中还没有任何用户时可用。
+// 创建成功后此入口即永久关闭（返回 403），避免裸奔窗口被抢注。
+func (s *Server) bootstrap(c *gin.Context) {
+	if s.auth.HasUsers() {
+		c.JSON(http.StatusForbidden, gin.H{"code": "FORBIDDEN", "message": "管理员已存在，引导入口已关闭"})
+		return
+	}
+	var req bootstrapReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"code": "INVALID_PARAM", "message": err.Error()})
+		return
+	}
+	if err := s.auth.Create(req.Username, req.Password, auth.RoleAdmin); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"code": "INVALID_PARAM", "message": err.Error()})
+		return
+	}
+	tok, role, err := s.auth.Login(req.Username, req.Password, c.ClientIP())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"code": "INTERNAL", "message": err.Error()})
+		return
+	}
+	s.auditActionAs(c, "auth.bootstrap", gin.H{"user": req.Username}, req.Username)
+	s.issueSession(c, tok, role)
+	c.JSON(http.StatusCreated, gin.H{"user": req.Username, "role": role})
+}
+
+func (s *Server) login(c *gin.Context) {
+	var req bootstrapReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"code": "INVALID_PARAM", "message": err.Error()})
+		return
+	}
+	key := req.Username + "|" + c.ClientIP()
+	tok, role, err := s.auth.Login(req.Username, req.Password, key)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"code": "BAD_CREDENTIALS", "message": err.Error()})
+		return
+	}
+	s.auditActionAs(c, "auth.login", gin.H{"user": req.Username}, req.Username)
+	s.issueSession(c, tok, role)
+	c.JSON(http.StatusOK, gin.H{"user": req.Username, "role": role})
+}
+
+// issueSession 设置 cookie（预览/下载标签用）并回显 token（XHR 用 Authorization 头）。
+func (s *Server) issueSession(c *gin.Context, tok string, role auth.Role) {
+	http.SetCookie(c.Writer, &http.Cookie{
+		Name:     "ufile_token",
+		Value:    tok,
+		Path:     "/",
+		MaxAge:   int((24 * time.Hour).Seconds()),
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+	})
+	c.Header("X-Auth-Token", tok) // 前端读取后走 Authorization 头
+	_ = role
+}
+
+func (s *Server) authStatus(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{"auth_enabled": s.auth != nil, "needs_bootstrap": s.auth != nil && !s.auth.HasUsers()})
+}
+
+func (s *Server) me(c *gin.Context) {
+	user, _ := c.Get("user")
+	role, _ := c.Get("role")
+	c.JSON(http.StatusOK, gin.H{"user": user, "role": role})
+}
+
+func (s *Server) createUser(c *gin.Context) {
+	var req struct {
+		Username string    `json:"username"`
+		Password string    `json:"password"`
+		Role     auth.Role `json:"role"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"code": "INVALID_PARAM", "message": err.Error()})
+		return
+	}
+	if req.Role == "" {
+		req.Role = auth.RoleGuest
+	}
+	if err := s.auth.Create(req.Username, req.Password, req.Role); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"code": "INVALID_PARAM", "message": err.Error()})
+		return
+	}
+	s.auditAction(c, "auth.user.create", gin.H{"target": req.Username, "role": req.Role})
+	c.JSON(http.StatusCreated, gin.H{"user": req.Username, "role": req.Role})
+}
+
+type viewUser struct {
+	Name      string    `json:"username"`
+	Role      auth.Role `json:"role"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+func (s *Server) listUsers(c *gin.Context) {
+	users := s.auth.List()
+	out := make([]viewUser, 0, len(users))
+	for _, u := range users {
+		out = append(out, viewUser{Name: u.Name, Role: u.Role, CreatedAt: u.CreatedAt})
+	}
+	c.JSON(http.StatusOK, out)
+}
+
+func (s *Server) deleteUser(c *gin.Context) {
+	name := c.Param("name")
+	if me, _ := c.Get("user"); me == name {
+		c.JSON(http.StatusBadRequest, gin.H{"code": "INVALID_PARAM", "message": "不能删除当前登录账号"})
+		return
+	}
+	if err := s.auth.Remove(name); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"code": "INVALID_PARAM", "message": err.Error()})
+		return
+	}
+	s.auditAction(c, "auth.user.delete", gin.H{"target": name})
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+func (s *Server) resetPassword(c *gin.Context) {
+	var req struct {
+		Password string `json:"password"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"code": "INVALID_PARAM", "message": err.Error()})
+		return
+	}
+	if err := s.auth.ChangePassword(c.Param("name"), req.Password); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"code": "INVALID_PARAM", "message": err.Error()})
+		return
+	}
+	s.auditAction(c, "auth.user.reset_password", gin.H{"target": c.Param("name")})
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+// logout 清除会话 cookie（JWT 本身无状态，服务端不维护黑名单；到期自然失效）。
+func (s *Server) logout(c *gin.Context) {
+	http.SetCookie(c.Writer, &http.Cookie{Name: "ufile_token", Value: "", Path: "/", MaxAge: -1, HttpOnly: true})
+	s.auditAction(c, "auth.logout", nil)
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
 
 func (s *Server) resolveSource(c *gin.Context) (*source.Source, bool) {
 	src, err := s.sources.Get(c.Param("id"))
@@ -161,7 +416,28 @@ func (s *Server) addSource(c *gin.Context) {
 		s.fail(c, err)
 		return
 	}
+	s.auditAction(c, "source.add", gin.H{"id": req.ID, "type": req.Type})
 	c.JSON(http.StatusCreated, src)
+}
+
+// updateSource 编辑已有源（ID/类型不可变）。请求体：{"name", "config"}。
+// config 中凭据字段为打码值 "******" 时保留数据库里的旧凭据。
+func (s *Server) updateSource(c *gin.Context) {
+	var req struct {
+		Name   string         `json:"name"`
+		Config map[string]any `json:"config"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"code": "INVALID_PARAM", "message": err.Error()})
+		return
+	}
+	src, err := s.sources.Update(c.Param("id"), req.Name, req.Config, true)
+	if err != nil {
+		s.fail(c, err)
+		return
+	}
+	s.auditAction(c, "source.update", gin.H{"id": c.Param("id")})
+	c.JSON(http.StatusOK, src)
 }
 
 func (s *Server) removeSource(c *gin.Context) {
@@ -169,6 +445,7 @@ func (s *Server) removeSource(c *gin.Context) {
 		s.fail(c, err)
 		return
 	}
+	s.auditAction(c, "source.delete", gin.H{"id": c.Param("id")})
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
@@ -245,6 +522,7 @@ func (s *Server) importSources(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"code": "IMPORT_FAILED", "message": err.Error()})
 		return
 	}
+	s.auditAction(c, "source.import", gin.H{"total": rep.Total, "added": rep.Added, "updated": rep.Updated, "failed": rep.Failed})
 	c.JSON(http.StatusOK, rep)
 }
 
@@ -256,15 +534,50 @@ func (s *Server) listFiles(c *gin.Context) {
 		return
 	}
 	limit, _ := strconv.Atoi(c.Query("limit"))
-	res, err := src.Driver().List(c.Request.Context(), c.Query("path"), driver.ListOptions{
-		Cursor: c.Query("cursor"),
-		Limit:  limit,
-	})
+	refresh := c.Query("refresh") == "1" // 手动刷新绕过索引缓存
+	var res *driver.ListResult
+	var err error
+	if s.index != nil {
+		s.index.Touch(src.ID)
+		res, err = s.index.List(c.Request.Context(), src.ID, src.Driver(), c.Query("path"), driver.ListOptions{
+			Cursor: c.Query("cursor"),
+			Limit:  limit,
+		}, refresh)
+	} else {
+		res, err = src.Driver().List(c.Request.Context(), c.Query("path"), driver.ListOptions{
+			Cursor: c.Query("cursor"),
+			Limit:  limit,
+		})
+	}
 	if err != nil {
 		s.fail(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, res)
+}
+
+// syncStatus 单源同步状态。
+func (s *Server) syncStatus(c *gin.Context) {
+	if _, ok := s.resolveSource(c); !ok {
+		return
+	}
+	c.JSON(http.StatusOK, s.index.StatusOf(c.Param("id")))
+}
+
+// syncTrigger 立即触发单源同步（后台异步执行）。
+func (s *Server) syncTrigger(c *gin.Context) {
+	src, ok := s.resolveSource(c)
+	if !ok {
+		return
+	}
+	go s.index.SyncSource(context.Background(), src.ID, src.Driver())
+	s.auditAction(c, "index.sync_trigger", gin.H{"id": src.ID})
+	c.JSON(http.StatusAccepted, gin.H{"ok": true, "message": "同步已开始"})
+}
+
+// indexStatus 全部源同步状态。
+func (s *Server) indexStatus(c *gin.Context) {
+	c.JSON(http.StatusOK, s.index.AllStatus())
 }
 
 // serveInline /raw 与 /download 共用的流式输出：disposition 决定 inline 还是 attachment。

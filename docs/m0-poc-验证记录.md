@@ -120,3 +120,72 @@ Web「＋ 新增文件源」弹窗（类型选择 + 动态字段 + 测试连接 
 - 鉴权（JWT）、源管理 API、凭据 AES-GCM 加密落库
 - 索引缓存（TTL + 定时同步）、游标分页的前端接入
 - FTP/SFTP 驱动
+
+---
+
+## M1 验证记录（2026-10-27）
+
+> 范围：P0 安全基线（凭据加密、登录鉴权、审计）+ 索引缓存与后台同步 + 源编辑。
+> 环境：Windows 10 x64 / Go 1.27.1。注：本机无 C 编译器，`-race` 不可用，以 `-count=3` 多轮并发测试替代。
+
+### 1. 凭据加密落库（internal/crypt + internal/source）
+
+- AES-256-GCM，密文格式 `enc:v1:<b64(nonce|ct)>`；主密钥 `data/master.key`（32B 随机，0600，首次自动生成）
+- 内存明文 / 落库密文：加解密只在 sources.json 读写边界；非敏感字段（endpoint/bucket）保持明文便于排查
+- **旧明文自动迁移**：加载时发现明文凭据 → 内存解出后立即加密重写（实测：把 M0 明文文件放入后启动，日志输出「已将明文凭据加密迁移」，磁盘不再含明文）
+- 主密钥不匹配：该源跳过并 warn，不阻断启动（其余源正常）
+- 单测：往返/随机 nonce/篡改检测/换钥匙失败/迁移/落盘无明文（`crypt_test.go`、`crypto_persist_test.go`）
+
+### 2. 鉴权（internal/auth + API 中间件）
+
+- 用户存 `data/users.json`（bcrypt，0600）；JWT HS256 签名密钥 `data/jwt.key`（与主密钥分离）
+- 引导流程：无用户时 `POST /auth/bootstrap` 创建首个管理员，创建后该入口永久 403（实测重放 → 403）
+- 角色：admin 全权；guest 只读（实测：列源/浏览 200，新增/删除/导出/列用户 403）
+- 登录限速：按「用户名+IP」连续失败 5 次起指数退避（实测：错 10 次后正确密码也被拒，文案含剩余等待；5s 后恢复）
+- 会话双通道：XHR 走 `Authorization: Bearer`；预览/下载标签走 HttpOnly Cookie（实测 cookie 访问 /raw 成功）
+- 安全细节：用户不存在时也做 bcrypt 比较（抹平时序）；用户被删后其 token 立即失效（Verify 查库）
+- 单测：`auth_test.go` 8 例（引导/角色/时序/最后管理员/改密/限速/退避增长/删除用户失效）
+
+### 3. 审计日志（internal/audit）
+
+- 追加写 `data/audit.log`（JSONL）：登录/登出/用户管理/源增删改/导入/手动同步
+- 实测记录完整，user 字段对登录类动作记录尝试登录的用户名（登录时尚无会话，auditActionAs 显式传入）
+
+### 4. 索引缓存与后台同步（internal/index）
+
+- 目录列表 TTL 缓存（10 分钟）+ `?refresh=1` 绕过；游标分页请求永不缓存
+- 后台每小时全量同步：BFS 遍历目录树逐目录刷新（单源 10 分钟/1 万目录上限）；失败记录原因与时间，下轮重试
+- 快照 `data/index.json`：同步后落盘，重启加载（实测：重启后 List 直接命中不回源）
+- 单测：`index_test.go` 9 例（命中/refresh/TTL 过期/游标不缓存/BFS 遍历/失败记录与恢复/Forget/快照往返/StartStop 循环）
+
+### 5. 端到端冒烟（真实二进制 + curl，隔离 data 目录）
+
+| 用例 | 结果 |
+|---|---|
+| 未登录访问任意 API → 401 | ✅ |
+| 引导创建管理员 201 + X-Auth-Token；重放 403 | ✅ |
+| admin 列源/新增/浏览/下载/PUT 编辑 | ✅ |
+| guest 创建 → 只读放行、写操作 403 | ✅ |
+| Cookie 方式访问 /raw（预览场景） | ✅ |
+| 手动触发同步 202 → 状态 running→success；快照落盘 | ✅ |
+| users.json 仅 bcrypt 哈希、sources.json 无明文凭据 | ✅ |
+| 登录连续失败触发限速，退避结束后恢复 | ✅ |
+| 重启后管理员仍在、索引快照加载 | ✅ |
+| 审计日志完整（bootstrap/login/user.create/source.update/sync_trigger） | ✅ |
+
+### 6. 过程中发现并修复的缺陷
+
+| 缺陷 | 影响 | 修复 |
+|---|---|---|
+| 数据目录硬编码 `./data`，与 `-config` 指定的目录脱节 | 配置与数据分离部署时写错位置 | 新增 `-data` 参数，全链路传递 |
+| auditAction 在登录/引导阶段读不到会话用户，记录 `<nil>` | 审计无法追溯操作者 | 新增 auditActionAs 显式传用户名 |
+| index.Cache 源枚举依赖「已浏览过」的缓存键 | 从未浏览的源不参与后台同步 | 装配时注入 `listIDs` 回调（接 source.Manager.IDs） |
+| dirCache 无 JSON tag | 快照保存后字段丢失，恢复后缓存全空 | 补 `at`/`res` tag |
+| 测试向 failOn map 存 nil error | List 误判为应失败 → 空指针 | delete 键代替存 nil |
+
+### 7. M1 已知边界 / 转入 M2
+
+- 真实云联调仍待做（gofakes3 不验签名；本轮冒烟未覆盖 S3 源的鉴权链路，仅 local）
+- 游标分页前端未接（S3 大目录翻页仍用「下一页/上一页」栈式游标，可用；万级目录的跳页体验在 M2 搜索/排序一起做）
+- FTP/SFTP 驱动、上传、删除/重命名等写操作 → M2
+- SQLite 迁移：当前文件型存储在万级以下条目够用，索引规模上来后再评估

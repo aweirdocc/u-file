@@ -1,6 +1,8 @@
-# u-file M0 PoC 配置示例。复制为 config.yaml 后按需启用。
-# 注意：PoC 阶段凭据明文存放于本文件，仅限本地联调；
-# 生产阶段将改为 Web 录入 + AES-GCM 加密落库（见 docs/04-总体架构设计）。
+# u-file 配置示例。复制为 config.yaml 后按需启用。
+# 注意：
+#   - 源定义持久化于 data/sources.json，凭据 AES-256-GCM 加密（主密钥 data/master.key，首次启动自动生成，请备份）；
+#   - config.yaml 仅在 sources.json 不存在时作为初始导入（播种），之后以页面/API 管理为准；
+#   - 数据目录可用 -data 参数指定（默认 ./data），含 users.json / audit.log / index.json。
 server:
   port: 8080
 

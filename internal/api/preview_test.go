@@ -34,11 +34,11 @@ func newPreviewServer(t *testing.T) *gin.Engine {
 	}
 	mgr, err := source.NewManager(t.TempDir(), []source.Seed{
 		{ID: "s", Name: "s", Type: "local", Config: map[string]any{"root": dir}},
-	})
+	}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(mgr)
+	srv, err := New(mgr, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

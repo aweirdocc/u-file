@@ -1,5 +1,6 @@
 # 本地运行数据（含明文凭据，严禁提交）
 data/
+smoke/
 *.log
 ufile.exe
 fakes3.exe

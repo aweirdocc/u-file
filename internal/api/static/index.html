@@ -19,9 +19,10 @@
   .src { display:inline-flex; align-items:center; gap:6px; margin:0 8px 8px 0; padding:6px 8px 6px 14px; background:var(--card); border:1px solid var(--line); border-radius:999px; cursor:pointer; }
   .src:hover { border-color:var(--accent); }
   .src.active { border-color:var(--accent); color:var(--accent); }
-  .src .del { display:none; border:none; background:transparent; color:var(--muted); cursor:pointer; font-size:12px; padding:0 4px; border-radius:999px; }
-  .src:hover .del { display:inline; }
+  .src .del, .src .edit { display:none; border:none; background:transparent; color:var(--muted); cursor:pointer; font-size:12px; padding:0 4px; border-radius:999px; }
+  .src:hover .del, .src:hover .edit { display:inline; }
   .src .del:hover { color:var(--danger); }
+  .src .edit:hover { color:var(--accent); }
   .crumbs { display:flex; flex-wrap:wrap; gap:4px; align-items:center; margin-bottom:12px; color:var(--muted); min-height:22px; }
   .crumbs a { color:var(--accent); text-decoration:none; cursor:pointer; }
   .card { background:var(--card); border:1px solid var(--line); border-radius:10px; overflow:hidden; }
@@ -61,6 +62,9 @@
   .hint { font-size:12px; color:var(--muted); margin-top:4px; }
   .field { display:none; }
   .field.show { display:block; }
+  #syncBar.syncing { color:var(--accent); }
+  #btnRefresh { color:var(--muted); text-decoration:none; margin-left:6px; }
+  #btnRefresh:hover { color:var(--accent); }
   /* 预览弹窗 */
   .pv { position:fixed; inset:0; background:rgba(17,24,39,.65); display:none; align-items:center; justify-content:center; padding:28px; z-index:20; }
   .pv.open { display:flex; }
@@ -87,7 +91,9 @@
 </head>
 <body>
 <header>
-  <b>🗂 u-file</b><span class="tag">PoC</span><span class="sub">统一文件管理服务平台</span>
+  <b>🗂 u-file</b><span class="tag">M1</span><span class="sub">统一文件管理服务平台</span>
+  <span id="whoami" class="muted" style="font-size:12px"></span>
+  <button id="btnLogout" style="display:none">退出</button>
   <button id="btnImport">导入配置</button>
   <button id="btnExport">导出配置</button>
   <button id="btnAdd">＋ 新增文件源</button>
@@ -95,6 +101,7 @@
 <main>
   <div id="sources"></div>
   <div class="crumbs" id="crumbs"></div>
+  <div id="syncBar" style="display:none;font-size:12px;color:var(--muted);margin:-6px 0 10px"></div>
   <div class="card">
     <table>
       <thead><tr><th style="width:52%">名称</th><th style="width:14%">大小</th><th>修改时间</th><th style="width:150px">操作</th></tr></thead>
@@ -107,7 +114,22 @@
     </div>
   </div>
 </main>
-<footer>u-file PoC · 无鉴权演示，请勿暴露公网</footer>
+<footer>u-file M1 · 凭据已加密落库 · 操作记录审计日志</footer>
+
+<!-- 登录 / 引导 -->
+<div class="pv" id="authLayer" style="z-index:30">
+  <div class="dialog" style="width:400px">
+    <h3 id="authTitle">登录 u-file</h3>
+    <label>用户名</label><input id="authUser" autocomplete="username">
+    <label>密码</label><input id="authPass" type="password" autocomplete="current-password">
+    <div class="hint" id="authHint" style="display:none">首次使用：创建的账号即为<b>管理员</b>（引导入口随后永久关闭）</div>
+    <div class="btns">
+      <span id="authMsg" class="hint" style="margin:0"></span>
+      <span class="spacer"></span>
+      <button class="btn primary" id="btnAuthGo">登录</button>
+    </div>
+  </div>
+</div>
 
 <!-- 预览 -->
 <div class="pv" id="pv">
@@ -159,10 +181,10 @@
   </div>
 </div>
 
-<!-- 新增 / 管理文件源 -->
+<!-- 新增 / 编辑文件源 -->
 <div class="overlay" id="dlg">
   <div class="dialog">
-    <h3>新增文件源</h3>
+    <h3 id="dlgTitle">新增文件源</h3>
     <div class="row">
       <div><label>源 ID（唯一，字母数字-_）</label><input id="fId" placeholder="r2-demo"></div>
       <div><label>显示名称</label><input id="fName" placeholder="我的 R2（可留空）"></div>
@@ -225,16 +247,74 @@ const icon = n =>
   /\.(mp3|flac|wav|ogg|m4a)$/i.test(n) ? '🎵' :
   /\.(zip|rar|7z|tar|gz|bz2)$/i.test(n) ? '🗜' : '📄';
 
+/* ---------- 鉴权 ---------- */
+
+let authToken = sessionStorage.getItem('ufile_token') || '';
+let myRole = '';
+
 async function api(method, url, body) {
+  const headers = body ? {'Content-Type': 'application/json'} : {};
+  if (authToken) headers['Authorization'] = 'Bearer ' + authToken;
   const res = await fetch(url, {
     method,
-    headers: body ? {'Content-Type': 'application/json'} : undefined,
+    headers,
     body: body ? JSON.stringify(body) : undefined,
   });
   const data = await res.json().catch(() => ({}));
+  if (res.status === 401) { showAuth(false); throw new Error('请先登录'); }
   if (!res.ok) throw new Error(data.message || (res.status + ' ' + res.statusText));
   return data;
 }
+
+let authMode = 'login'; // login | bootstrap
+function showAuth(bootstrap) {
+  authMode = bootstrap ? 'bootstrap' : 'login';
+  $('authTitle').textContent = bootstrap ? '初始化：创建管理员' : '登录 u-file';
+  $('btnAuthGo').textContent = bootstrap ? '创建并进入' : '登录';
+  $('authHint').style.display = bootstrap ? 'block' : 'none';
+  $('authMsg').textContent = '';
+  $('authLayer').classList.add('open');
+  $('authUser').focus();
+}
+function hideAuth() { $('authLayer').classList.remove('open'); }
+
+$('btnAuthGo').onclick = async () => {
+  const u = $('authUser').value.trim(), p = $('authPass').value;
+  if (!u || !p) { $('authMsg').textContent = '请输入用户名和密码'; return; }
+  $('authMsg').textContent = '……';
+  try {
+    const url = authMode === 'bootstrap' ? '/api/v1/auth/bootstrap' : '/api/v1/auth/login';
+    const res = await fetch(url, {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({username: u, password: p}),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) { $('authMsg').textContent = data.message || '失败'; return; }
+    authToken = res.headers.get('X-Auth-Token') || authToken;
+    if (authToken) sessionStorage.setItem('ufile_token', authToken);
+    myRole = data.role || '';
+    hideAuth();
+    await boot();
+  } catch (e) { $('authMsg').textContent = e.message; }
+};
+$('authPass').onkeydown = e => { if (e.key === 'Enter') $('btnAuthGo').click(); };
+
+$('btnLogout').onclick = async () => {
+  try { await api('POST', '/api/v1/auth/logout'); } catch (e) {}
+  sessionStorage.removeItem('ufile_token');
+  authToken = ''; myRole = '';
+  location.reload();
+};
+
+function applyRoleUI() {
+  const admin = myRole === 'admin';
+  $('btnAdd').style.display = admin ? '' : 'none';
+  $('btnImport').style.display = admin ? '' : 'none';
+  $('btnExport').style.display = admin ? '' : 'none';
+  $('btnLogout').style.display = authToken ? '' : 'none';
+  $('whoami').textContent = authToken ? `${whoName}（${admin ? '管理员' : '只读'}）` : '';
+}
+let whoName = '';
 
 /* ---------- 源管理 ---------- */
 
@@ -242,14 +322,16 @@ let sources = [];
 
 async function renderSources() {
   sources = await api('GET', '/api/v1/sources');
+  const admin = myRole === 'admin';
   const el = $('sources');
   el.innerHTML = sources.map(x =>
     `<span class="src ${x.id === source ? 'active' : ''}" data-id="${escAttr(x.id)}">` +
     `${esc(x.name || x.id)} <span class="muted">· ${esc(x.type)}</span>` +
-    `<button class="del" data-del="${escAttr(x.id)}" title="删除该文件源">✕</button></span>`
-  ).join('') || '<span class="muted">还没有文件源，点击右上角「新增文件源」</span>';
+    `<button class="edit" data-edit="${escAttr(x.id)}" title="编辑该文件源" style="${admin ? '' : 'display:none'}">✎</button>` +
+    `<button class="del" data-del="${escAttr(x.id)}" title="删除该文件源" style="${admin ? '' : 'display:none'}">✕</button></span>`
+  ).join('') || `<span class="muted">${admin ? '还没有文件源，点击右上角「新增文件源」' : '管理员尚未配置文件源'}</span>`;
   el.querySelectorAll('.src').forEach(el => el.onclick = ev => {
-    if (ev.target.dataset.del) return;
+    if (ev.target.dataset.del || ev.target.dataset.edit) return;
     nav(el.dataset.id, '');
   });
   el.querySelectorAll('.del').forEach(btn => btn.onclick = async ev => {
@@ -261,6 +343,10 @@ async function renderSources() {
       if (source === id) { source = ''; path = ''; }
       await renderSources(); render();
     } catch (e) { alert('删除失败：' + e.message); }
+  });
+  el.querySelectorAll('.edit').forEach(btn => btn.onclick = async ev => {
+    ev.stopPropagation();
+    await openEditDlg(btn.dataset.edit);
   });
 }
 
@@ -277,20 +363,60 @@ function curConfig() {
   };
   const pfx = $('fPrefix').value.trim();
   if (pfx) cfg.prefix = pfx;
-  if ($('fAK').value.trim()) cfg.access_key = $('fAK').value.trim();
-  if ($('fSK').value) cfg.secret_key = $('fSK').value;
+  const ak = $('fAK').value.trim();
+  if (ak) cfg.access_key = ak;
+  const sk = $('fSK').value;
+  if (sk) cfg.secret_key = sk;
   return cfg;
 }
 
+let editTarget = null; // null=新增；否则为待编辑的源 ID
+
+function fillDlg(srcDetail) {
+  // 用源详情回填表单（凭据回显为打码值，保存时后端保留旧凭据）
+  $('fId').value = srcDetail.id; $('fId').disabled = true;
+  $('fName').value = srcDetail.name === srcDetail.id ? '' : (srcDetail.name || '');
+  $('fType').value = srcDetail.type; syncFields();
+  $('fType').disabled = true;
+  const c = srcDetail.config || {};
+  if (srcDetail.type === 'local') $('fLocalRoot').value = c.root || '';
+  else {
+    $('fEndpoint').value = c.endpoint || '';
+    $('fRegion').value = c.region || '';
+    $('fBucket').value = c.bucket || '';
+    $('fPrefix').value = c.prefix || '';
+    $('fPathStyle').checked = !!c.use_path_style;
+    $('fAK').value = c.access_key || '';
+    $('fSK').value = c.secret_key || '';
+  }
+}
+
 function openDlg() {
+  editTarget = null;
   // 清空上次录入的全部内容（含 endpoint/AK/SK 等连接配置），避免残留到新源
   document.querySelectorAll('#dlg input, #dlg select').forEach(el => {
     if (el.type === 'checkbox') el.checked = false;
     else el.value = '';
   });
+  $('fId').disabled = false; $('fType').disabled = false;
+  $('dlgTitle').textContent = '新增文件源';
   $('fType').value = 's3'; syncFields();
   $('dlg').classList.add('open');
   $('fId').focus();
+}
+
+async function openEditDlg(id) {
+  try {
+    const detail = await api('GET', '/api/v1/sources/' + encodeURIComponent(id));
+    editTarget = id;
+    document.querySelectorAll('#dlg input, #dlg select').forEach(el => {
+      if (el.type === 'checkbox') el.checked = false;
+      else el.value = '';
+    });
+    fillDlg(detail);
+    $('dlgTitle').textContent = '编辑文件源：' + id;
+    $('dlg').classList.add('open');
+  } catch (e) { alert('加载源配置失败：' + e.message); }
 }
 function syncFields() {
   const t = $('fType').value;
@@ -324,18 +450,27 @@ $('btnTest').onclick = async () => {
 };
 
 $('btnSave').onclick = async () => {
-  const id = $('fId').value.trim();
-  if (!id) { alert('请填写源 ID'); return; }
   try {
-    await api('POST', '/api/v1/sources', {
-      id,
-      name: $('fName').value.trim(),
-      type: $('fType').value,
-      config: curConfig(),
-    });
-    $('dlg').classList.remove('open');
-    await renderSources();
-    nav(id, '');   // 保存后直接进入新源
+    if (editTarget) {
+      await api('PUT', '/api/v1/sources/' + encodeURIComponent(editTarget), {
+        name: $('fName').value.trim(),
+        config: curConfig(),   // 凭据若保持 ****** 则后端保留旧值
+      });
+      $('dlg').classList.remove('open');
+      await renderSources(); render();
+    } else {
+      const id = $('fId').value.trim();
+      if (!id) { alert('请填写源 ID'); return; }
+      await api('POST', '/api/v1/sources', {
+        id,
+        name: $('fName').value.trim(),
+        type: $('fType').value,
+        config: curConfig(),
+      });
+      $('dlg').classList.remove('open');
+      await renderSources();
+      nav(id, '');   // 保存后直接进入新源
+    }
   } catch (e) { alert('保存失败：' + e.message); }
 };
 
@@ -420,7 +555,7 @@ function nav(s, p) {
   render();
 }
 
-async function render() {
+async function render(refresh) {
   const crumbs = $('crumbs'), rows = $('rows');
   await renderSources().catch(e => {
     rows.innerHTML = `<tr><td colspan="4" class="empty">无法加载文件源：${esc(e.message)}</td></tr>`;
@@ -439,10 +574,13 @@ async function render() {
     acc += (acc ? '/' : '') + seg;
     bc += ` / <a data-path="${escAttr(acc)}">${esc(seg)}</a>`;
   });
+  bc += ` <a id="btnRefresh" title="绕过缓存，直接读源">⟳</a>`;
   crumbs.innerHTML = bc;
+  $('btnRefresh').onclick = () => render(true);
 
   rows.innerHTML = '<tr><td colspan="4" class="empty">加载中……</td></tr>';
   const qs = new URLSearchParams({ path, limit: PAGE_SIZE });
+  if (refresh) qs.set('refresh', '1');
   const cursor = pageStack[pageStack.length - 1];
   if (cursor) qs.set('cursor', cursor);
   const res = await (await fetch(`/api/v1/sources/${encodeURIComponent(source)}/files?${qs}`)).json();
@@ -492,9 +630,44 @@ async function render() {
   });
   rows.querySelectorAll('a[data-presign]').forEach(a => a.onclick = async ev => {
     ev.preventDefault();
-    const r = await (await fetch(`/api/v1/sources/${encodeURIComponent(source)}/presign?path=${a.dataset.presign}`)).json();
+    const r = await (await fetchPresign(a.dataset.presign)).json();
     if (r.url) window.open(r.url);
   });
+
+  loadSyncStatus();
+}
+
+// fetchPresign 预览/直链等非 JSON API 的 fetch，统一带上 token
+function fetchPresign(pathEnc) {
+  return fetch(`/api/v1/sources/${encodeURIComponent(source)}/presign?path=${pathEnc}`, {
+    headers: authToken ? {'Authorization': 'Bearer ' + authToken} : {},
+  });
+}
+
+/* ---------- 同步状态 ---------- */
+
+async function loadSyncStatus() {
+  try {
+    const st = await api('GET', `/api/v1/sources/${encodeURIComponent(source)}/sync`);
+    const el = $('syncBar');
+    let txt = '', cls = 'muted';
+    if (st.running) {
+      txt = `⟳ 后台同步中：${st.current_dir || '…'}（已刷 ${st.synced_dirs} 个目录）`;
+      cls = 'syncing';
+    } else if (st.last_success) {
+      txt = `✓ 上次同步成功：${new Date(st.last_success).toLocaleString('zh-CN', {hour12:false})}（${st.dirs} 个目录）`;
+    } else if (st.last_error) {
+      txt = `⚠ 同步失败：${st.last_error}`;
+      cls = 'bad';
+    } else {
+      el.style.display = 'none';
+      return;
+    }
+    el.textContent = txt;
+    el.className = cls;
+    el.style.display = 'block';
+    if (st.running) setTimeout(loadSyncStatus, 2000);
+  } catch (e) { /* 状态获取失败不打扰浏览 */ }
 }
 
 $('pgPrev').onclick = () => {
@@ -608,7 +781,36 @@ window.addEventListener('popstate', () => {
   pageStack = ['']; curNextCursor = '';
   render();
 });
-render();
+
+// boot 启动流程：检查鉴权状态 → 引导/登录 → 加载界面
+async function boot() {
+  try {
+    const me = await api('GET', '/api/v1/auth/me');
+    whoName = me.user || ''; myRole = me.role || '';
+  } catch (e) { whoName = ''; }
+  applyRoleUI();
+  render();
+}
+(async function init() {
+  try {
+    const st = await (await fetch('/api/v1/auth/status')).json();
+    if (st.auth_enabled) {
+      if (authToken) {
+        // 已有 token，验证之
+        try {
+          const me = await api('GET', '/api/v1/auth/me');
+          whoName = me.user || ''; myRole = me.role || '';
+          applyRoleUI(); render();
+          return;
+        } catch (e) { /* token 失效，走登录 */ }
+      }
+      showAuth(st.needs_bootstrap);
+      return; // 登录完成后由 boot() 继续
+    }
+  } catch (e) { /* 状态接口不可达也继续（无鉴权旧版本兼容） */ }
+  applyRoleUI();
+  render();
+})();
 </script>
 </body>
 </html>
