@@ -29,6 +29,7 @@ type Capabilities struct {
 	Download   bool `json:"download"`
 	PresignURL bool `json:"presign_url"` // 可生成带签名直链（S3 协议族）
 	ListCursor bool `json:"list_cursor"` // List 支持游标分页
+	Write      bool `json:"write"`       // 实现了 Writer（上传/删除/建目录/重命名）
 }
 
 // Entry 文件或目录的元数据。Path 统一以 / 分隔、相对源根且不以 / 开头；根目录为 ""。
@@ -75,4 +76,18 @@ type FSDriver interface {
 // 上层通过类型断言探测：if p, ok := drv.(driver.Presigner); ok { ... }
 type Presigner interface {
 	PresignGet(ctx context.Context, path string, ttl time.Duration) (string, error)
+}
+
+// Writer 是可选写能力：上传、删除、新建目录、重命名。
+// 约定：
+//   - Upload 由调用方负责关闭 r；size 为已知大小（<=0 表示未知，驱动自行处理）；
+//   - Delete 对文件与目录统一处理：目录语义为“删除该前缀下全部内容”（S3）/
+//     “递归删除”（local/ftp/sftp）；不存在返回 ErrNotFound；
+//   - Rename 同一源内移动/重命名；目标已存在时行为由驱动决定（覆盖），由 API 层先做存在性提示；
+//   - Mkdir 创建目录（父目录不存在时一并创建，与主流对象存储前缀语义一致）。
+type Writer interface {
+	Upload(ctx context.Context, path string, r io.Reader, size int64) error
+	Delete(ctx context.Context, path string) error
+	Mkdir(ctx context.Context, path string) error
+	Rename(ctx context.Context, from, to string) error
 }

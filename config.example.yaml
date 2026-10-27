@@ -61,3 +61,29 @@ sources:
   #     access_key: <SecretId>
   #     secret_key: <SecretKey>
   #     use_path_style: false    # 2024-01-01 后创建的桶不支持 path-style
+
+  # —— FTP / FTPS（M2 起）——
+  # - id: ftp-demo
+  #   name: 老系统 FTP
+  #   type: ftp
+  #   config:
+  #     host: 192.168.1.100
+  #     port: 21                # 默认 21
+  #     username: user
+  #     password: pass
+  #     tls: false              # true = FTPS（显式 AUTH TLS）
+  #     insecure_tls: false     # 自签证书时跳过校验
+  #     root: /srv/files        # 可选，默认根
+
+  # —— SFTP（M2 起；password 与 private_key 二选一）——
+  # - id: sftp-demo
+  #   name: VPS SFTP
+  #   type: sftp
+  #   config:
+  #     host: 203.0.113.10
+  #     port: 22                # 默认 22
+  #     username: root
+  #     password: pass          # 方式一：密码
+  #     # private_key: /home/me/.ssh/id_ed25519   # 方式二：私钥（PEM 文件路径或内容原文）
+  #     # private_key_passphrase: xxx              # 私钥口令（无则省略）
+  #     root: /var/www          # 可选，默认根

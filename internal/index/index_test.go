@@ -235,3 +235,46 @@ func TestStartStopLoop(t *testing.T) {
 	}
 	c.Stop()
 }
+
+func TestSearch(t *testing.T) {
+	d := newMemDriver()
+	d.addDir("", driver.Entry{Path: "报告.pdf", Name: "报告.pdf"}, driver.Entry{Path: "readme.txt", Name: "readme.txt"}, driver.Entry{Path: "sub", Name: "sub", IsDir: true})
+	d.addDir("sub", driver.Entry{Path: "sub/notes.txt", Name: "notes.txt"})
+	ids, src := getSrcOf(d)
+	c := New(t.TempDir(), Config{SyncEvery: -1}, ids, src)
+	c.SyncAll(context.Background())
+
+	// 包含匹配（大小写不敏感）；s1/s2 共享同一驱动，每个源各命中一次
+	hits := c.Search("README", "", 0)
+	if len(hits) != 2 || hits[0].Name != "readme.txt" {
+		t.Fatalf("README 搜索: %+v", hits)
+	}
+	// 中文（每源各一次）
+	if hits := c.Search("报告", "", 0); len(hits) != 2 {
+		t.Fatalf("中文搜索: %+v", hits)
+	}
+	// 按源过滤
+	if hits := c.Search("txt", "other", 0); len(hits) != 0 {
+		t.Fatalf("按源过滤应排除: %+v", hits)
+	}
+	if hits := c.Search("txt", "s1", 0); len(hits) != 2 {
+		t.Fatalf("s1 内搜索: %+v", hits)
+	}
+	_ = c.Search("报告", "s1", 0)
+	// limit 生效
+	if hits := c.Search("txt", "", 1); len(hits) != 1 {
+		t.Fatalf("limit: %+v", hits)
+	}
+	// 空查询
+	if hits := c.Search("  ", "", 0); hits != nil {
+		t.Fatal("空查询应返回 nil")
+	}
+	// 快照恢复后仍可搜
+	dir := t.TempDir()
+	c2 := New(dir, Config{SyncEvery: -1, Snapshot: true}, ids, src)
+	c2.SyncAll(context.Background())
+	c3 := New(dir, Config{SyncEvery: -1, Snapshot: true}, ids, src)
+	if hits := c3.Search("notes", "s1", 0); len(hits) != 1 {
+		t.Fatalf("快照恢复后搜索: %+v", hits)
+	}
+}

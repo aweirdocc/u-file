@@ -4,16 +4,19 @@
 package s3
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
 
 	"ufile/internal/driver"
@@ -72,7 +75,9 @@ func (d *S3) Scheme() string { return "s3" }
 func (d *S3) Capabilities() driver.Capabilities {
 	// 预签名直链依赖有效凭据：无凭据（匿名只读场景）时不声明该能力，
 	// 否则 PresignGetObject 会因 noAuth signer 直接报错。
-	return driver.Capabilities{List: true, Stat: true, Download: true, PresignURL: d.credent, ListCursor: true}
+	// 写操作同样需要凭据。
+	write := d.credent
+	return driver.Capabilities{List: true, Stat: true, Download: true, PresignURL: d.credent, ListCursor: true, Write: write}
 }
 
 func (d *S3) List(ctx context.Context, dir string, opt driver.ListOptions) (*driver.ListResult, error) {
@@ -238,6 +243,188 @@ func (d *S3) PresignGet(ctx context.Context, path string, ttl time.Duration) (st
 		return "", fmt.Errorf("s3: PresignGetObject: %w", err)
 	}
 	return req.URL, nil
+}
+
+// —— 写能力（Writer；需凭据）——
+
+// Upload 上传对象（PutObject 流式；size 已知时声明 Content-Length）。
+func (d *S3) Upload(ctx context.Context, path string, r io.Reader, size int64) error {
+	rel, err := driver.CleanPath(path)
+	if err != nil {
+		return err
+	}
+	if rel == "" || strings.HasSuffix(path, "/") {
+		return driver.ErrInvalidPath
+	}
+	if !d.credent {
+		return errors.New("s3: 未配置凭据，不支持写操作")
+	}
+	in := &s3.PutObjectInput{
+		Bucket: aws.String(d.bucket),
+		Key:    aws.String(d.prefix + rel),
+		Body:   r,
+	}
+	if size > 0 {
+		in.ContentLength = aws.Int64(size)
+	}
+	if _, err := d.client.PutObject(ctx, in); err != nil {
+		return fmt.Errorf("s3: PutObject: %w", err)
+	}
+	return nil
+}
+
+// Delete 删除对象；目录语义为删除该前缀下全部对象（分批，每批至多 1000）。
+func (d *S3) Delete(ctx context.Context, path string) error {
+	rel, err := driver.CleanPath(path)
+	if err != nil {
+		return err
+	}
+	if rel == "" {
+		return driver.ErrInvalidPath // 源根不可删
+	}
+	if !d.credent {
+		return errors.New("s3: 未配置凭据，不支持写操作")
+	}
+	key := d.prefix + rel
+
+	// 先按对象删（普通对象 + 目录占位对象）
+	if _, err := d.client.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String(d.bucket), Key: aws.String(key),
+	}); err != nil {
+		return fmt.Errorf("s3: DeleteObject: %w", err)
+	}
+	// 目录：批量删除前缀下全部对象
+	var after string
+	for {
+		in := &s3.ListObjectsV2Input{
+			Bucket: aws.String(d.bucket), Prefix: aws.String(key + "/"), MaxKeys: aws.Int32(1000),
+		}
+		if after != "" {
+			in.ContinuationToken = aws.String(after)
+		}
+		out, err := d.client.ListObjectsV2(ctx, in)
+		if err != nil {
+			return fmt.Errorf("s3: ListObjectsV2: %w", err)
+		}
+		if len(out.Contents) > 0 {
+			ids := make([]types.ObjectIdentifier, 0, len(out.Contents))
+			for _, o := range out.Contents {
+				ids = append(ids, types.ObjectIdentifier{Key: o.Key})
+			}
+			if _, err := d.client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+				Bucket: aws.String(d.bucket),
+				Delete: &types.Delete{Objects: ids, Quiet: aws.Bool(true)},
+			}); err != nil {
+				return fmt.Errorf("s3: DeleteObjects: %w", err)
+			}
+		}
+		if !aws.ToBool(out.IsTruncated) {
+			break
+		}
+		after = aws.ToString(out.NextContinuationToken)
+	}
+	return nil
+}
+
+// Mkdir 创建目录占位对象（零字节 key/），父前缀一并补齐。
+func (d *S3) Mkdir(ctx context.Context, path string) error {
+	rel, err := driver.CleanPath(path)
+	if err != nil {
+		return err
+	}
+	if rel == "" {
+		return driver.ErrInvalidPath
+	}
+	if !d.credent {
+		return errors.New("s3: 未配置凭据，不支持写操作")
+	}
+	if _, err := d.client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(d.bucket),
+		Key:    aws.String(d.prefix + rel + "/"),
+		Body:   bytes.NewReader(nil),
+	}); err != nil {
+		return fmt.Errorf("s3: PutObject(placeholder): %w", err)
+	}
+	return nil
+}
+
+// Rename 重命名/移动：先 CopyObject 到新键，再删旧键；目录则逐对象拷贝。
+func (d *S3) Rename(ctx context.Context, from, to string) error {
+	srcRel, err := driver.CleanPath(from)
+	if err != nil {
+		return err
+	}
+	dstRel, err := driver.CleanPath(to)
+	if err != nil {
+		return err
+	}
+	if srcRel == "" || dstRel == "" || srcRel == dstRel {
+		return driver.ErrInvalidPath
+	}
+	if !d.credent {
+		return errors.New("s3: 未配置凭据，不支持写操作")
+	}
+	if strings.HasPrefix(dstRel, srcRel+"/") {
+		return driver.ErrInvalidPath // 不能移进自己
+	}
+	srcKey := d.prefix + srcRel
+	dstKey := d.prefix + dstRel
+
+	// 尝试按对象重命名
+	if _, err := d.client.CopyObject(ctx, &s3.CopyObjectInput{
+		Bucket:     aws.String(d.bucket),
+		Key:        aws.String(dstKey),
+		CopySource: aws.String(url.PathEscape(d.bucket + "/" + srcKey)),
+	}); err != nil {
+		if !isNotFound(err) {
+			return fmt.Errorf("s3: CopyObject: %w", err)
+		}
+		// 不是对象 → 按目录：枚举前缀逐个拷贝再删
+		return d.renamePrefix(ctx, srcKey+"/", dstKey+"/")
+	}
+	if _, err := d.client.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String(d.bucket), Key: aws.String(srcKey),
+	}); err != nil {
+		return fmt.Errorf("s3: DeleteObject: %w", err)
+	}
+	return nil
+}
+
+func (d *S3) renamePrefix(ctx context.Context, srcPrefix, dstPrefix string) error {
+	var after string
+	for {
+		in := &s3.ListObjectsV2Input{
+			Bucket: aws.String(d.bucket), Prefix: aws.String(srcPrefix), MaxKeys: aws.Int32(1000),
+		}
+		if after != "" {
+			in.ContinuationToken = aws.String(after)
+		}
+		out, err := d.client.ListObjectsV2(ctx, in)
+		if err != nil {
+			return fmt.Errorf("s3: ListObjectsV2: %w", err)
+		}
+		for _, o := range out.Contents {
+			key := aws.ToString(o.Key)
+			newKey := dstPrefix + strings.TrimPrefix(key, srcPrefix)
+			if _, err := d.client.CopyObject(ctx, &s3.CopyObjectInput{
+				Bucket:     aws.String(d.bucket),
+				Key:        aws.String(newKey),
+				CopySource: aws.String(url.PathEscape(d.bucket + "/" + key)),
+			}); err != nil {
+				return fmt.Errorf("s3: CopyObject: %w", err)
+			}
+			if _, err := d.client.DeleteObject(ctx, &s3.DeleteObjectInput{
+				Bucket: aws.String(d.bucket), Key: aws.String(key),
+			}); err != nil {
+				return fmt.Errorf("s3: DeleteObject: %w", err)
+			}
+		}
+		if !aws.ToBool(out.IsTruncated) {
+			break
+		}
+		after = aws.ToString(out.NextContinuationToken)
+	}
+	return nil
 }
 
 // isNotFound 兼容各家 S3 实现对“不存在”的不同表达：

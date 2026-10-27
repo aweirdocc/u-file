@@ -93,6 +93,7 @@
 <header>
   <b>🗂 u-file</b><span class="tag">M1</span><span class="sub">统一文件管理服务平台</span>
   <span id="whoami" class="muted" style="font-size:12px"></span>
+  <input id="searchBox" placeholder="🔍 搜索文件名（回车）" style="background:#1f2937;border:1px solid #374151;color:#e5e7eb;border-radius:6px;padding:5px 10px;font-size:13px;width:200px">
   <button id="btnLogout" style="display:none">退出</button>
   <button id="btnImport">导入配置</button>
   <button id="btnExport">导出配置</button>
@@ -102,6 +103,15 @@
   <div id="sources"></div>
   <div class="crumbs" id="crumbs"></div>
   <div id="syncBar" style="display:none;font-size:12px;color:var(--muted);margin:-6px 0 10px"></div>
+  <div id="toolbar" style="display:none;margin-bottom:10px;display:flex;gap:8px;align-items:center">
+    <button class="btn primary" id="btnUpload">⬆ 上传</button>
+    <button class="btn plain" id="btnMkdir">📁 新建文件夹</button>
+    <input type="file" id="uploadInput" multiple style="display:none">
+    <span class="spacer" style="flex:1"></span>
+    <span id="selInfo" class="muted" style="font-size:12px"></span>
+    <button class="btn plain" id="btnZipSel" style="display:none">🗜 打包下载选中</button>
+    <button class="btn danger" id="btnDelSel" style="display:none">🗑 删除选中</button>
+  </div>
   <div class="card">
     <table>
       <thead><tr><th style="width:52%">名称</th><th style="width:14%">大小</th><th>修改时间</th><th style="width:150px">操作</th></tr></thead>
@@ -593,17 +603,23 @@ async function render(refresh) {
 
   let html = '';
   if (path) html += `<tr><td class="name"><a data-path="${escAttr(parentOf(path))}">↰ ..</a></td><td class="muted">—</td><td class="muted">—</td><td></td></tr>`;
+  const admin = myRole === 'admin';
+  const canWrite = admin && cur.capabilities.write;
   for (const e of res.entries) {
+    const chk = canWrite ? `<input type="checkbox" class="rowSel" data-p="${escAttr(e.path)}" data-dir="${e.is_dir}"> ` : '';
+    let acts = '';
     if (e.is_dir) {
-      html += `<tr><td class="name">📁 <a data-path="${escAttr(e.path)}">${esc(e.name)}</a></td>` +
-              `<td class="muted">—</td><td class="muted">${fmtTime(e.mod_time)}</td><td></td></tr>`;
+      if (canWrite) acts += `<a data-rename="${escAttr(e.path)}" data-name="${escAttr(e.name)}">重命名</a>`;
+      html += `<tr><td class="name">${chk}📁 <a data-path="${escAttr(e.path)}">${esc(e.name)}</a></td>` +
+              `<td class="muted">—</td><td class="muted">${fmtTime(e.mod_time)}</td><td class="acts">${acts}</td></tr>`;
     } else {
       const dl = `/api/v1/sources/${encodeURIComponent(source)}/download?path=${encodeURIComponent(e.path)}`;
       const pk = previewKind(e.name);
-      let acts = `<a href="${dl}">下载</a>`;
-      if (pk) acts = `<a data-preview="${escAttr(e.path)}">预览</a>` + acts;
+      if (pk) acts += `<a data-preview="${escAttr(e.path)}">预览</a>`;
+      acts += `<a href="${dl}">下载</a>`;
       if (cur.capabilities.presign_url) acts += `<a data-presign="${encodeURIComponent(e.path)}">直链</a>`;
-      html += `<tr><td class="name">${icon(e.name)} ${esc(e.name)}</td>` +
+      if (canWrite) acts += `<a data-rename="${escAttr(e.path)}" data-name="${escAttr(e.name)}">重命名</a>`;
+      html += `<tr><td class="name">${chk}${icon(e.name)} ${esc(e.name)}</td>` +
               `<td>${fmtSize(e.size)}</td><td class="muted">${fmtTime(e.mod_time)}</td>` +
               `<td class="acts">${acts}</td></tr>`;
     }
@@ -633,8 +649,138 @@ async function render(refresh) {
     const r = await (await fetchPresign(a.dataset.presign)).json();
     if (r.url) window.open(r.url);
   });
+  rows.querySelectorAll('a[data-rename]').forEach(a => a.onclick = async ev => {
+    ev.preventDefault();
+    const oldName = a.dataset.name, oldPath = a.dataset.rename;
+    const newName = prompt('重命名为：', oldName);
+    if (!newName || newName === oldName) return;
+    const to = (parentOf(oldPath) ? parentOf(oldPath) + '/' : '') + newName;
+    try {
+      await api('POST', `/api/v1/sources/${encodeURIComponent(source)}/rename`, {from: oldPath, to});
+      render(true);
+    } catch (e) { alert('重命名失败：' + e.message); }
+  });
 
+  rows.querySelectorAll('.rowSel').forEach(el => el.onchange = () => updateSelUI());
+  updateSelUI(res.entries);
   loadSyncStatus();
+}
+
+/* ---------- 写操作工具栏（M2） ---------- */
+
+let curEntries = [];
+
+function updateSelUI(entries) {
+  if (entries) curEntries = entries;
+  const admin = myRole === 'admin';
+  const cur = sources.find(x => x.id === source);
+  const canWrite = admin && source && (cur ? cur.capabilities.write : false);
+  const toolbar = $('toolbar');
+  if (!source || !curEntries) { toolbar.style.display = 'none'; return; }
+  toolbar.style.display = canWrite ? 'flex' : 'none';
+  if (!canWrite) { $('selInfo').textContent = ''; return; }
+  const n = document.querySelectorAll('.rowSel:checked').length;
+  $('selInfo').textContent = n ? `已选 ${n} 项` : '';
+  $('btnZipSel').style.display = n ? '' : 'none';
+  $('btnDelSel').style.display = n ? '' : 'none';
+  $('btnDelSel').textContent = n > 1 ? `🗑 删除选中（${n}）` : '🗑 删除选中';
+}
+
+function selectedPaths() {
+  return [...document.querySelectorAll('.rowSel:checked')].map(el => el.dataset.p);
+}
+
+$('btnMkdir').onclick = async () => {
+  const name = prompt('新文件夹名称：');
+  if (!name) return;
+  const target = path ? path + '/' + name : name;
+  try {
+    await api('POST', `/api/v1/sources/${encodeURIComponent(source)}/mkdir`, {path: target});
+    render(true); // 绕缓存刷新
+  } catch (e) { alert('新建失败：' + e.message); }
+};
+
+$('btnUpload').onclick = () => $('uploadInput').click();
+$('uploadInput').onchange = async () => {
+  const files = $('uploadInput').files;
+  if (!files.length) return;
+  const fd = new FormData();
+  fd.append('path', path);
+  for (const f of files) fd.append('file', f);
+  $('btnUpload').disabled = true; $('btnUpload').textContent = '⬆ 上传中…';
+  try {
+    const res = await fetch(`/api/v1/sources/${encodeURIComponent(source)}/upload`, {
+      method: 'POST',
+      headers: authToken ? {'Authorization': 'Bearer ' + authToken} : {},
+      body: fd,
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.message || res.statusText);
+    const failed = (data.items || []).filter(i => !i.ok);
+    if (failed.length) alert('部分失败：\n' + failed.map(i => `${i.file}: ${i.error}`).join('\n'));
+    render(true);
+  } catch (e) { alert('上传失败：' + e.message); }
+  $('btnUpload').disabled = false; $('btnUpload').textContent = '⬆ 上传';
+  $('uploadInput').value = '';
+};
+
+$('btnDelSel').onclick = async () => {
+  const paths = selectedPaths();
+  if (!paths.length) return;
+  if (!confirm(`确定删除选中的 ${paths.length} 项？\n目录将连同其内容一起删除，且不可恢复！`)) return;
+  try {
+    const r = await api('POST', `/api/v1/sources/${encodeURIComponent(source)}/delete`, {paths});
+    if (r.failed) alert(`有 ${r.failed} 项删除失败：\n` + (r.items || []).filter(i => !i.ok).map(i => `${i.path}: ${i.error}`).join('\n'));
+    render(true);
+  } catch (e) { alert('删除失败：' + e.message); }
+};
+
+$('btnZipSel').onclick = () => {
+  const paths = selectedPaths();
+  if (!paths.length) return;
+  const qs = paths.map(p => 'paths=' + encodeURIComponent(p)).join('&');
+  const a = document.createElement('a');
+  a.href = `/api/v1/sources/${encodeURIComponent(source)}/archive?${qs}&name=${encodeURIComponent(path || source)}`;
+  a.download = '';
+  a.click();
+};
+
+/* ---------- 搜索 ---------- */
+
+$('searchBox').onkeydown = async ev => {
+  if (ev.key !== 'Enter') return;
+  const q = $('searchBox').value.trim();
+  if (!q) return;
+  await renderSearch(q);
+};
+
+async function renderSearch(q) {
+  const rows = $('rows'), crumbs = $('crumbs');
+  crumbs.innerHTML = `<b>搜索：「${esc(q)}」</b> <a id="searchBack" style="cursor:pointer;color:var(--accent)">返回浏览</a>`;
+  $('searchBack').onclick = () => render();
+  rows.innerHTML = '<tr><td colspan="4" class="empty">搜索中……</td></tr>';
+  $('pager').style.display = 'none';
+  $('toolbar').style.display = 'none';
+  try {
+    const r = await api('GET', `/api/v1/search?q=${encodeURIComponent(q)}&limit=100`);
+    if (!r.hits.length) {
+      rows.innerHTML = `<tr><td colspan="4" class="empty">没有匹配「${esc(q)}」的文件（仅搜索已索引/已同步的目录）</td></tr>`;
+      return;
+    }
+    rows.innerHTML = r.hits.map(h => {
+      const dl = `/api/v1/sources/${encodeURIComponent(h.source_id)}/download?path=${encodeURIComponent(h.path)}`;
+      const open = h.is_dir
+        ? `<a data-open-src="${escAttr(h.source_id)}" data-open-path="${escAttr(h.path)}" style="cursor:pointer;color:var(--accent)">进入</a>`
+        : `<a href="${dl}">下载</a>`;
+      return `<tr><td class="name">${h.is_dir ? '📁' : icon(h.name)} ${esc(h.name)}</td>` +
+        `<td class="muted">${esc(h.source_name || h.source_id)}</td>` +
+        `<td class="muted" style="max-width:280px;overflow:hidden;text-overflow:ellipsis">${esc(h.path)}</td>` +
+        `<td class="acts">${open}</td></tr>`;
+    }).join('');
+    rows.querySelectorAll('a[data-open-src]').forEach(a => a.onclick = () => nav(a.dataset.openSrc, a.dataset.openPath));
+  } catch (e) {
+    rows.innerHTML = `<tr><td colspan="4" class="empty">搜索失败：${esc(e.message)}</td></tr>`;
+  }
 }
 
 // fetchPresign 预览/直链等非 JSON API 的 fetch，统一带上 token

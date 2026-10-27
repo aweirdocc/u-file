@@ -27,10 +27,10 @@ import (
 
 // Config 索引配置。
 type Config struct {
-	TTL         time.Duration // 目录缓存存活时间；0 = 默认 10 分钟
-	SyncEvery   time.Duration // 后台全量同步周期；0 = 默认 1 小时，<0 = 禁用后台同步
-	Snapshot    bool          // 是否持久化快照到 data/index.json
-	MaxEntries  int           // 缓存目录条目上限（超出不缓存，防止单目录百万级撑爆内存）
+	TTL        time.Duration // 目录缓存存活时间；0 = 默认 10 分钟
+	SyncEvery  time.Duration // 后台全量同步周期；0 = 默认 1 小时，<0 = 禁用后台同步
+	Snapshot   bool          // 是否持久化快照到 data/index.json
+	MaxEntries int           // 缓存目录条目上限（超出不缓存，防止单目录百万级撑爆内存）
 }
 
 // Status 单源同步状态。
@@ -55,7 +55,7 @@ type Cache struct {
 	dirs    map[string]*dirCache // key: sourceID + "\x00" + dir
 	status  map[string]*Status   // sourceID → 同步状态
 	file    string               // data/index.json；空 = 不持久化
-	listIDs func() []string                  // 枚举全部源 ID（装配时接 source.Manager）
+	listIDs func() []string      // 枚举全部源 ID（装配时接 source.Manager）
 	getSrc  func(id string) (driver.FSDriver, bool)
 	cancel  context.CancelFunc
 	started bool
@@ -72,10 +72,10 @@ func New(dataDir string, cfg Config, listIDs func() []string, getSrc func(id str
 		cfg.TTL = 10 * time.Minute
 	}
 	c := &Cache{
-		ttl:    cfg.TTL,
-		maxEnt: cfg.MaxEntries,
-		dirs:   map[string]*dirCache{},
-		status: map[string]*Status{},
+		ttl:     cfg.TTL,
+		maxEnt:  cfg.MaxEntries,
+		dirs:    map[string]*dirCache{},
+		status:  map[string]*Status{},
 		listIDs: listIDs,
 		getSrc:  getSrc,
 	}
@@ -163,6 +163,65 @@ func (c *Cache) Invalidate(sourceID string) {
 }
 
 // —— 后台同步 ——
+
+// —— 文件名搜索（基于缓存/快照，M2）——
+
+// SearchHit 单条搜索结果。
+type SearchHit struct {
+	SourceID string    `json:"source_id"`
+	Path     string    `json:"path"`
+	Name     string    `json:"name"`
+	IsDir    bool      `json:"is_dir"`
+	Size     int64     `json:"size"`
+	ModTime  time.Time `json:"mod_time"`
+}
+
+// Search 在缓存（含快照恢复的数据）里按文件名做大小写不敏感的包含匹配。
+// sourceID 非空时只搜该源。只返回已索引（浏览过或后台同步过）的内容——
+// 这是“索引缓存搜索”的语义边界：零配置但覆盖依赖同步深度。
+func (c *Cache) Search(query, sourceID string, limit int) []SearchHit {
+	q := strings.ToLower(strings.TrimSpace(query))
+	if q == "" {
+		return nil
+	}
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	hits := make([]SearchHit, 0, limit)
+	seen := map[string]bool{}
+	keys := make([]string, 0, len(c.dirs))
+	for k := range c.dirs {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		id := strings.SplitN(k, "\x00", 2)[0]
+		if sourceID != "" && id != sourceID {
+			continue
+		}
+		dc := c.dirs[k]
+		if dc == nil || dc.Res == nil {
+			continue
+		}
+		for _, e := range dc.Res.Entries {
+			key := id + "\x00" + e.Path
+			if seen[key] || !strings.Contains(strings.ToLower(e.Name), q) {
+				continue
+			}
+			seen[key] = true
+			hits = append(hits, SearchHit{
+				SourceID: id, Path: e.Path, Name: e.Name,
+				IsDir: e.IsDir, Size: e.Size, ModTime: e.ModTime,
+			})
+			if len(hits) >= limit {
+				return hits
+			}
+		}
+	}
+	return hits
+}
 
 // SyncSource 立即同步单个源（手动触发入口）。
 func (c *Cache) SyncSource(ctx context.Context, sourceID string, drv driver.FSDriver) {

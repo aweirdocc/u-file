@@ -189,3 +189,67 @@ Web「＋ 新增文件源」弹窗（类型选择 + 动态字段 + 测试连接 
 - 游标分页前端未接（S3 大目录翻页仍用「下一页/上一页」栈式游标，可用；万级目录的跳页体验在 M2 搜索/排序一起做）
 - FTP/SFTP 驱动、上传、删除/重命名等写操作 → M2
 - SQLite 迁移：当前文件型存储在万级以下条目够用，索引规模上来后再评估
+
+---
+
+## M2 验证记录（2026-10-27）
+
+> 范围：P1 写能力（上传/删除/重命名/建目录）、批量与 zip 打包下载、文件名搜索、FTP/FTPS/SFTP 驱动。
+> 模块代理：本机默认 proxy.golang.org 不可达，依赖拉取走 `GOPROXY=https://goproxy.cn,direct`。
+
+### 1. 驱动写能力（可选 Writer 接口）
+
+- 接口：`Upload(path, r, size) / Delete / Mkdir / Rename(from, to)`；能力位 `Write` 声明给前端显隐
+- local：MkdirAll 父目录、覆盖写、RemoveAll 递归删、Rename（含跨盘退化复制删除、禁止移进自己/根）
+- s3：PutObject 上传、DeleteObject + 前缀批量 DeleteObjects（目录递归删）、零字节占位对象建目录、
+  CopyObject+Delete 重命名（目录逐对象拷贝）；无凭据的匿名源不声明 Write（只读）
+- 冒烟（对 fakes3，`TestS3WriteSmoke`，环境变量门控同 TestS3Smoke）：建目录→上传→读回→文件改名→目录改名→递归删，全部通过
+
+### 2. FTP/FTPS 驱动（internal/driver/ftp，jlaffaye/ftp v0.2.4）
+
+- 配置：host/port/username/password/tls(FTPS)/insecure_tls/root
+- 连接管理：池内单控制连接 + NOOP 探活 + 断线重拨重试一次；**下载每次专用连接**（FTP 控制连接上的数据传输互踩，不复用）
+- 续传：RetrFrom(REST)；列表：List（解析目录/文件/大小/时间）；写：Stor / Delete / RemoveDirRecur / Rename / 逐级 MakeDir
+- 单测：配置解析、路径（..、反斜杠拒绝）、能力位、550/450 错误分类；真实服务器集成 `TestFTPLiveSmoke` 环境变量门控（本机无 FTP 服务，未跑）
+
+### 3. SFTP 驱动（internal/driver/sftpdrv，pkg/sftp v1.13.12）
+
+- 配置：host/port/username + password 或 private_key（PEM 内容或文件路径，passphrase 可选）
+- host key 策略：accept-new 语义（首连记录、变更拒绝，防静默中间人；文档注明 M2 简化边界）
+- SFTP 单连接多路复用（无 FTP 数据通道问题），断线重拨；Seek 支持随机读
+- 单测：配置校验（凭据必填其一）、密码/私钥（PKCS#8 PEM 文件与内容两种形态）/坏私钥、路径、
+  host key 策略矩阵（首连/同密钥/变更/异主机）；真实集成 `TestSFTPLiveSmoke` 门控未跑
+
+### 4. API 写端点 + 打包 + 搜索
+
+- `POST /upload`（multipart 多文件逐个报告）、`POST /mkdir`、`POST /delete`（批量，目录递归）、`POST /rename`
+- `GET /archive?paths=...`：zip 流式打包（zip.Store 不二次压缩；上限 1 万文件/2GB；目录 BFS 递归）
+- `GET /search?q=&source=&limit=`：基于索引缓存/快照的跨源文件名搜索（大小写不敏感包含匹配）
+- 全部写端点 admin only + 审计；写后自动失效该源索引缓存
+
+### 5. 前端（内嵌单页）
+
+- 工具栏：⬆ 上传（多选文件、进度文案、部分失败明细）、📁 新建文件夹；仅 admin + 源有 write 能力时显示
+- 行内勾选（目录/文件统一）→「🗜 打包下载选中」「🗑 删除选中（N）」；每行「重命名」（prompt 改名）
+- 顶栏搜索框：回车跨源搜索，结果列源名/路径，目录可「进入」跳转浏览
+
+### 6. 端到端冒烟（真实二进制 + fakes3 + curl）
+
+| 用例 | 结果 |
+|---|---|
+| local multipart 双文件上传 → 逐文件 ok + 立即可见（缓存失效链路） | ✅ |
+| S3 上传 → 下载读回内容一致；mkdir 嵌套 x/y/z → 列表见占位 | ✅ |
+| S3 文件改名读回同内容；目录改名后内容跟随 | ✅ |
+| local 改名+移动（docs/f2 → docs/sub/moved）、删除 | ✅ |
+| S3 目录递归删（x 含 y2/z）→ 列表为空 | ✅ |
+| zip 打包（单文件 + 目录递归）→ Go 标准库解包核对 4 个文件内容与路径 | ✅ |
+| 搜索：先触发同步再搜，跨源命中（txt 5 条）、按源过滤、目录跳转 | ✅ |
+| guest 权限矩阵：browse/download 200；upload/mkdir/delete/rename 全 403 | ✅ |
+| 审计：file.upload/delete/mkdir/rename/archive、index.sync_trigger 全记录 | ✅ |
+
+### 7. M2 已知边界 / 转入 M3
+
+- FTP/SFTP 驱动未对真实服务器联调（本机无服务；协议行为由库层保证 + 单测覆盖配置/错误面）
+- SFTP host key 完整 TOFU（known_hosts 持久化）未做，重启后重新首连
+- 大目录体验：搜索依赖同步深度（万级条目目录已同步即可命中）；全文检索/排序在 P3
+- 数据库源（BLOB/GridFS）、分享外链、多用户 ACL、WebDAV 服务端 → M3（P2）

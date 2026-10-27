@@ -131,6 +131,18 @@ func New(cfgSources *source.Manager, authStore *auth.Store, auditLog *audit.Log,
 	grp.GET("/sources/:id/download", authAny, s.download)
 	grp.GET("/sources/:id/raw", authAny, s.raw)
 	grp.GET("/sources/:id/presign", authAny, s.presign)
+	grp.GET("/sources/:id/archive", authAny, s.archive) // 多选/整目录 zip 流式打包
+
+	// —— 写操作（admin；驱动需实现 Writer 能力）——
+	grp.POST("/sources/:id/upload", authAdmin, s.upload)
+	grp.POST("/sources/:id/mkdir", authAdmin, s.mkdir)
+	grp.POST("/sources/:id/delete", authAdmin, s.deleteEntries)
+	grp.POST("/sources/:id/rename", authAdmin, s.renameEntry)
+
+	// —— 搜索（基于索引快照；index 未启用时不注册）——
+	if s.index != nil {
+		grp.GET("/search", authAny, s.search)
+	}
 
 	// —— 索引/同步状态（M1 索引缓存，index 未启用时不注册）——
 	if s.index != nil {

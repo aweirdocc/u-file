@@ -3,6 +3,8 @@
 package all
 
 import (
+	_ "ufile/internal/driver/ftp"
 	_ "ufile/internal/driver/local"
 	_ "ufile/internal/driver/s3"
+	_ "ufile/internal/driver/sftpdrv"
 )

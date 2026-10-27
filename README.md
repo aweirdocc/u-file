@@ -2,7 +2,7 @@
 
 > **U**nified **File** —— 可私有化部署的统一文件管理服务平台：把对象存储（S3 / 阿里云 OSS / 腾讯云 COS / 华为云 OBS / 七牛 Kodo / 百度 BOS / Cloudflare R2 / MinIO）、FTP、SFTP、数据库（BLOB / GridFS）、本地磁盘等异构文件源统一接入，提供 Web 文件浏览、搜索、下载与基础管理能力。
 
-**当前状态：M1 MVP 安全基线与索引缓存已完成**（凭据 AES-GCM 加密落库 + 登录鉴权/角色/审计 + 目录索引缓存与后台同步 + 源编辑；M0 PoC：驱动抽象 + local/s3 驱动 + 流式下载网关）。规划文档见 [docs/](./docs/)。
+**当前状态：M2 已完成**（写能力：上传/删除/重命名/建目录 + zip 打包下载 + 索引搜索 + FTP/FTPS/SFTP 驱动；M1：凭据加密落库 + 登录鉴权/角色/审计 + 索引缓存与后台同步；M0：驱动抽象 + local/s3 驱动 + 流式下载网关）。规划文档见 [docs/](./docs/)。
 
 ## 文档导航
 
@@ -44,12 +44,14 @@ go test ./...
 
 > **安全提示（M1）**：已启用登录鉴权（JWT）与凭据加密落库，但仍建议：内网/本机部署 + 反向代理提供 HTTPS；**务必备份 `data/master.key`**——丢失后已保存的源凭据无法解密（源列表还在，重新填一遍凭据即可）。
 
-## 已接入的源类型（M0）
+## 已接入的源类型
 
 | 类型 | 配置要点 | 能力 |
 |---|---|---|
-| `local` | `root: 本地目录` | 列表 / 下载 / Range |
-| `s3` | `endpoint` `region` `bucket` `access_key` `secret_key` `use_path_style` `prefix`(可选) | 列表(游标分页) / 下载 / Range / 预签名直链(需凭据) |
+| `local` | `root: 本地目录` | 列表 / 下载 / Range / 上传·删除·重命名·建目录 |
+| `s3` | `endpoint` `region` `bucket` `access_key` `secret_key` `use_path_style` `prefix`(可选) | 列表(游标分页) / 下载 / Range / 预签名直链 / 写能力(需凭据) |
+| `ftp` | `host` `port`(默认21) `username` `password` `tls`(FTPS) `insecure_tls` `root`(可选) | 列表 / 下载(断点) / 写能力 |
+| `sftp` | `host` `port`(默认22) `username` + `password` 或 `private_key`(PEM 内容或路径，`private_key_passphrase` 可选) `root`(可选) | 列表 / 下载(Seek) / 写能力 |
 
 预置 endpoint 参考（写在 `config.example.yaml` 注释里）：MinIO `http://host:9000` + path-style；R2 `https://<ACCOUNT_ID>.r2.cloudflarestorage.com` + region `auto`；OSS `https://s3.oss-{region}.aliyuncs.com`；COS `https://cos.<region>.myqcloud.com`（桶名 `<Bucket>-<APPID>`）。
 
@@ -75,6 +77,14 @@ go test ./...
 | GET | `/api/v1/sources/{id}/files?path=&cursor=&limit=&refresh=1` | 登录 | 目录列表（命中索引缓存；`refresh=1` 绕过缓存直读源） |
 | GET | `/api/v1/sources/{id}/sync` | 登录 | 该源索引同步状态（上次成功/失败原因/进行中） |
 | POST | `/api/v1/sources/{id}/sync` | admin | 立即触发该源同步 |
+| GET | `/api/v1/search?q=关键词&source=源ID(可选)&limit=50` | 登录 | 跨源文件名搜索（基于索引/快照，大小写不敏感包含匹配） |
+| POST | `/api/v1/sources/{id}/upload` | admin | multipart 上传（`file` 可多个 + `path` 目标目录），逐文件报告结果 |
+| POST | `/api/v1/sources/{id}/mkdir` | admin | 新建目录：`{"path": "a/b/c"}`（逐级创建） |
+| POST | `/api/v1/sources/{id}/delete` | admin | 批量删除：`{"paths": [...]}`（目录递归删） |
+| POST | `/api/v1/sources/{id}/rename` | admin | 重命名/移动：`{"from", "to"}`（目录含内容整体移动） |
+| GET | `/api/v1/sources/{id}/archive?paths=a&paths=docs/&name=包名` | 登录 | 多选/整目录 zip 流式打包下载（不落盘；上限 1 万文件/2GB） |
+
+写操作仅对声明了 `write` 能力位的源开放（界面上自动显隐）。S3 匿名源（无凭据）为只读。
 
 **持久化规则**：源定义存于 `data/sources.json`，凭据字段以 AES-256-GCM 加密（密文前缀 `enc:v1:`），主密钥为 `data/master.key`（首次启动自动生成，0600）；旧版明文 `sources.json` 首次启动自动加密迁移。`config.yaml` 仅在首次启动（该文件不存在时）播种导入，之后以页面/API 管理为准，已删除的源不会被配置文件复活。API 响应永不回显明文凭据（打码为 `******`）。
 
@@ -87,12 +97,14 @@ go test ./...
 - **限速**：登录按「用户名+来源 IP」限速，连续失败 5 次起指数退避（5s 起，封顶 15 分钟）
 - **审计**：登录/登出/用户变更/源增删改/导入导出/手动同步 记录至 `data/audit.log`（JSONL，人可读）
 
-## 索引缓存与后台同步（M1）
+## 索引缓存、同步与搜索（M1/M2）
 
 - 目录列表默认走索引缓存（TTL 10 分钟），命中时响应 <10ms；点面包屑旁的 **⟳** 或带 `?refresh=1` 绕过缓存直读源
 - 后台每小时自动全量同步各源目录树（逐目录刷新，单源单轮 10 分钟/1 万目录上限），同步状态在文件列表上方展示（进行中/上次成功/失败原因）
 - 同步完成后快照落盘 `data/index.json`，重启后浏览秒开
 - 下载/预览/Stat 永远直读源，不受缓存影响（保证字节级正确）
+- **搜索**：顶栏搜索框回车即跨源搜文件名（命中索引/快照内容；只搜已同步过的目录，这是零配置方案的语义边界）
+- 写操作（上传/删除/重命名/建目录）完成后自动失效该源缓存，浏览即时可见
 
 ## 文件预览
 
@@ -113,11 +125,11 @@ go test ./...
 
 ## 核心设计一览
 
-- **统一驱动抽象**：`FSDriver` 接口 + 能力位（Capabilities），协议差异全部隔离在驱动层；写能力在 M2 以可选接口扩展
-- **面向流**：下载全程 `io.Copy` 流式转发（1GB 文件实测服务端峰值内存 ~16MB），`http.ServeContent` 提供 Range/断点续传
+- **统一驱动抽象**：`FSDriver` 接口 + 能力位（Capabilities），协议差异全部隔离在驱动层；写能力为可选 `Writer` 接口（local/s3/ftp/sftp 已实现）
+- **面向流**：下载全程 `io.Copy` 流式转发（1GB 文件实测服务端峰值内存 ~16MB），`http.ServeContent` 提供 Range/断点续传；zip 打包同为流式（不落盘不整载）
 - **直链模式**：`Presigner` 可选能力 + `?direct=1` 302 跳转，省网关带宽
 - **凭据加密**：源配置敏感字段 AES-256-GCM 加密落库（内存中明文仅供驱动使用，API 永不回显明文）；主密钥与 JWT 密钥分离存放
 
 ## 技术栈
 
-Go 1.22+ / Gin · aws-sdk-go-v2（S3 协议族统一接入） · golang.org/x/crypto（bcrypt） · 内嵌单页 Web UI（原生 JS，无构建步骤） · 文件型存储（sources.json / users.json / index.json / audit.log，SQLite 视需求后置）
+Go 1.22+ / Gin · aws-sdk-go-v2（S3 协议族统一接入） · jlaffaye/ftp（FTP/FTPS） · pkg/sftp + x/crypto/ssh（SFTP） · golang.org/x/crypto（bcrypt） · 内嵌单页 Web UI（原生 JS，无构建步骤） · 文件型存储（sources.json / users.json / index.json / audit.log，SQLite 视需求后置）
