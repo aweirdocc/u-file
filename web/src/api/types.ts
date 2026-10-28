@@ -100,3 +100,23 @@ export interface UserInfo {
   role: Exclude<Role, ''>
   created_at: string
 }
+
+/** 分享外链（管理面视图；不含提取码哈希） */
+export interface ShareInfo {
+  id: string
+  token: string
+  source_id: string
+  path: string
+  name: string
+  size: number
+  is_dir: boolean
+  has_password: boolean
+  expires_at: string
+  max_downloads?: number
+  downloads: number
+  created_by: string
+  created_at: string
+  revoked: boolean
+  /** 仅公开信息接口返回：当前访客是否已解锁（无码或已通过提取码） */
+  unlocked?: boolean
+}

@@ -2,10 +2,17 @@ package api
 
 import (
 	"bytes"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"ufile/internal/audit"
 	"ufile/internal/auth"
@@ -26,7 +33,7 @@ func newAuthServer(t *testing.T) (http.Handler, *auth.Store) {
 		t.Fatal(err)
 	}
 	alog, _ := audit.Open(t.TempDir(), nil)
-	srv, err := New(mgr, store, alog, nil, testWebFS(t))
+	srv, err := New(mgr, store, alog, nil, nil, testWebFS(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -197,4 +204,84 @@ func TestAuditLogWritten(t *testing.T) {
 	postJSON(t, h, "/api/v1/auth/bootstrap", "", map[string]string{"username": "root", "password": "password123"})
 	// 审计文件应已记录 bootstrap（写在自己的 dataDir，通过接口不便读；至少确认不 panic + 200 链路）
 	// 深度验证在 audit 包单测覆盖
+}
+
+// encryptLoginPayload 用服务端公钥按前端约定加密密码（RSA-OAEP-SHA256 + JSON 时间戳）。
+func encryptLoginPayload(t *testing.T, pubPEM []byte, password string, ts int64) string {
+	t.Helper()
+	blk, _ := pem.Decode(pubPEM)
+	if blk == nil {
+		t.Fatal("公钥 PEM 解析失败")
+	}
+	pubAny, err := x509.ParsePKIXPublicKey(blk.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub, ok := pubAny.(*rsa.PublicKey)
+	if !ok {
+		t.Fatal("公钥类型错误")
+	}
+	payload, _ := json.Marshal(map[string]any{"p": password, "ts": ts})
+	ct, err := rsa.EncryptOAEP(sha256.New(), rand.Reader, pub, payload, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return base64.StdEncoding.EncodeToString(ct)
+}
+
+func TestEncryptedLogin(t *testing.T) {
+	h, _ := newAuthServer(t)
+	bootstrapAdmin(t, h)
+
+	// 1. 公钥端点无需登录
+	w := getAuth(t, h, "/api/v1/auth/pubkey", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("公钥端点应 200，实际 %d", w.Code)
+	}
+	var pk struct {
+		Alg       string `json:"alg"`
+		PublicKey string `json:"public_key"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &pk); err != nil || pk.Alg != "RSA-OAEP-256" || pk.PublicKey == "" {
+		t.Fatalf("公钥响应不符: %s", w.Body.String())
+	}
+
+	now := time.Now().Unix()
+
+	// 2. 信封加密登录成功（password 留空）
+	encPwd := encryptLoginPayload(t, []byte(pk.PublicKey), "password123", now)
+	w = postJSON(t, h, "/api/v1/auth/login", "", map[string]string{"username": "root", "password_enc": encPwd})
+	if w.Code != http.StatusOK {
+		t.Fatalf("加密登录应 200，实际 %d: %s", w.Code, w.Body.String())
+	}
+	if w.Header().Get("X-Auth-Token") == "" {
+		t.Fatal("加密登录应返回 X-Auth-Token")
+	}
+
+	// 3. 密文被篡改 → 400
+	bad := encPwd[:len(encPwd)-8] + "AAAAAAAA"
+	w = postJSON(t, h, "/api/v1/auth/login", "", map[string]string{"username": "root", "password_enc": bad})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("篡改密文应 400，实际 %d", w.Code)
+	}
+
+	// 4. 时间戳超窗（重放）→ 400
+	stale := encryptLoginPayload(t, []byte(pk.PublicKey), "password123", now-3600)
+	w = postJSON(t, h, "/api/v1/auth/login", "", map[string]string{"username": "root", "password_enc": stale})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("过期密文应 400，实际 %d", w.Code)
+	}
+
+	// 5. 明文回退仍可用（HTTPS 部署/非安全上下文兼容）
+	w = postJSON(t, h, "/api/v1/auth/login", "", map[string]string{"username": "root", "password": "password123"})
+	if w.Code != http.StatusOK {
+		t.Fatalf("明文回退登录应 200，实际 %d", w.Code)
+	}
+
+	// 6. 加密登录也能用于引导流程后的错误密码 → 401（解密成功但校验失败）
+	encWrong := encryptLoginPayload(t, []byte(pk.PublicKey), "wrong-password", now)
+	w = postJSON(t, h, "/api/v1/auth/login", "", map[string]string{"username": "root", "password_enc": encWrong})
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("错误密码信封应 401，实际 %d", w.Code)
+	}
 }

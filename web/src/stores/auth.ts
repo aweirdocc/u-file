@@ -1,8 +1,9 @@
-// 鉴权状态：token（sessionStorage）、当前用户、角色、引导/登录弹窗控制。
+// 鉴权状态：token（sessionStorage）、当前用户、角色、登录跳转。
 import { defineStore } from 'pinia'
 import { getToken, setToken, setUnauthorizedHandler } from '../api/client'
 import * as api from '../api'
 import type { Role } from '../api/types'
+import router from '../router'
 
 export const useAuthStore = defineStore('auth', {
   state: () => ({
@@ -11,8 +12,8 @@ export const useAuthStore = defineStore('auth', {
     role: '' as Role,
     /** null=未初始化；true=无用户需引导；false=正常登录 */
     needsBootstrap: null as boolean | null,
-    /** 登录/引导弹窗可见性 */
-    authDialogVisible: false,
+    /** 401 前的页面路径，登录成功后回跳 */
+    redirect: '',
   }),
   getters: {
     isLoggedIn: (s) => !!s.token && !!s.user,
@@ -20,16 +21,20 @@ export const useAuthStore = defineStore('auth', {
     roleLabel: (s) => (s.role === 'admin' ? '管理员' : s.role === 'guest' ? '只读' : ''),
   },
   actions: {
-    /** 注册 401 全局拦截 → 弹登录 */
+    /** 注册 401 全局拦截 → 跳登录页（带回跳地址） */
     bindInterceptor() {
       setUnauthorizedHandler(() => {
         this.token = ''
         this.user = ''
         this.role = ''
-        this.authDialogVisible = true
+        setToken('')
+        const cur = router.currentRoute.value
+        if (cur.path === '/login') return // 登录页自身的 401 不再跳，防循环
+        this.redirect = cur.fullPath
+        router.push('/login')
       })
     },
-    /** 启动初始化：status → token 验证 → 弹引导或登录 */
+    /** 启动初始化：status → token 验证 → 未登录跳登录页 */
     async init() {
       try {
         const st = await api.getAuthStatus()
@@ -46,7 +51,11 @@ export const useAuthStore = defineStore('auth', {
             /* token 失效，走登录 */
           }
         }
-        this.authDialogVisible = true
+        const cur = router.currentRoute.value
+        if (cur.path !== '/login' && !cur.meta.public) {
+          this.redirect = cur.fullPath
+          router.push('/login')
+        }
       } catch {
         // status 接口不可达：按无鉴权兼容处理
         this.needsBootstrap = false
@@ -70,13 +79,16 @@ export const useAuthStore = defineStore('auth', {
       this.token = getToken() // client 已从 X-Auth-Token 捕获
       this.user = r.user
       this.role = r.role as Role
-      this.authDialogVisible = false
+      const target = this.redirect || '/'
+      this.redirect = ''
+      router.replace(target)
     },
     async logout() {
       try { await api.logout() } catch { /* 忽略 */ }
       setToken('')
       this.token = ''; this.user = ''; this.role = ''
-      location.href = '/'
+      this.redirect = ''
+      router.replace('/login')
     },
   },
 })

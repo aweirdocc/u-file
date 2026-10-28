@@ -24,6 +24,7 @@ import (
 	"ufile/internal/crypt"
 	"ufile/internal/driver"
 	"ufile/internal/index"
+	"ufile/internal/share"
 	"ufile/internal/source"
 	"ufile/web"
 
@@ -117,6 +118,12 @@ func main() {
 	// 源删除时联动清理索引（复用 Manager 的删除钩子）
 	mgr.OnRemove = idxCache.Forget
 
+	// 分享外链（M3）：data/shares.json；grant cookie 签名复用 jwt.key（独立主密钥会多一个要备份的文件）
+	shareMgr, err := share.NewManager((*dataDir), jwtSecret)
+	if err != nil {
+		log.Fatalf("初始化分享存储失败: %v", err)
+	}
+
 	// 前端静态资源：默认内嵌 web/dist；-web 参数可指向磁盘目录（前端开发调试）
 	var webFS fs.FS
 	if *webDir != "" {
@@ -129,7 +136,7 @@ func main() {
 		}
 	}
 
-	srv, err := api.New(mgr, authStore, auditLog, idxCache, webFS)
+	srv, err := api.New(mgr, authStore, auditLog, idxCache, shareMgr, webFS)
 	if err != nil {
 		log.Fatalf("初始化失败: %v", err)
 	}

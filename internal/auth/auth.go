@@ -10,6 +10,7 @@ package auth
 import (
 	"crypto/hmac"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
@@ -58,7 +59,7 @@ type user struct {
 	hash []byte
 }
 
-// Store 用户存储 + JWT 签发。
+// Store 用户存储 + JWT 签发 + 登录密码解密。
 type Store struct {
 	mu    sync.RWMutex
 	file  string // data/users.json
@@ -67,6 +68,9 @@ type Store struct {
 	order []string
 
 	limiter *limiter
+
+	loginKey *rsa.PrivateKey // 登录信封私钥（data/login.key）
+	pubPEM   []byte          // 对应公钥（SPKI PEM，供前端加密）
 }
 
 // NewStore 打开（或初始化）用户存储。secret 为 JWT 签名密钥。
@@ -74,11 +78,21 @@ func NewStore(dataDir string, secret []byte) (*Store, error) {
 	if err := os.MkdirAll(dataDir, 0o755); err != nil {
 		return nil, err
 	}
+	loginKey, err := loadOrCreateLoginKey(dataDir)
+	if err != nil {
+		return nil, err
+	}
+	pubPEM, err := publicKeyPEM(loginKey)
+	if err != nil {
+		return nil, err
+	}
 	s := &Store{
-		file:    filepath.Join(dataDir, "users.json"),
-		secret:  secret,
-		users:   map[string]*user{},
-		limiter: newLimiter(),
+		file:     filepath.Join(dataDir, "users.json"),
+		secret:   secret,
+		users:    map[string]*user{},
+		limiter:  newLimiter(),
+		loginKey: loginKey,
+		pubPEM:   pubPEM,
 	}
 	s.limiter.gc()
 	raw, err := os.ReadFile(s.file)

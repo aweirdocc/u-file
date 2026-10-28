@@ -20,6 +20,7 @@ import (
 	"ufile/internal/auth"
 	"ufile/internal/driver"
 	"ufile/internal/index"
+	"ufile/internal/share"
 	"ufile/internal/source"
 )
 
@@ -83,15 +84,16 @@ type Server struct {
 	auth      *auth.Store
 	audit     *audit.Log
 	index     *index.Cache // 可为 nil（未启用索引缓存）
+	shares    *share.Manager // 可为 nil（未启用分享外链）
 	webFS     fs.FS        // 前端静态资源（Vue 构建产物）
 	indexHTML []byte       // 入口 index.html（启动时读入）
 }
 
 // New 构造 API 服务。authStore/auditLog 可为 nil（无鉴权模式）；
-// indexCache 可为 nil（未启用索引缓存）；webFS 为前端静态资源（必传）。
-func New(cfgSources *source.Manager, authStore *auth.Store, auditLog *audit.Log, indexCache *index.Cache, webFS fs.FS) (*Server, error) {
+// indexCache/sharesMgr 可为 nil（未启用索引缓存/分享外链）；webFS 为前端静态资源（必传）。
+func New(cfgSources *source.Manager, authStore *auth.Store, auditLog *audit.Log, indexCache *index.Cache, sharesMgr *share.Manager, webFS fs.FS) (*Server, error) {
 	gin.SetMode(gin.ReleaseMode)
-	s := &Server{engine: gin.New(), sources: cfgSources, auth: authStore, audit: auditLog, index: indexCache, webFS: webFS}
+	s := &Server{engine: gin.New(), sources: cfgSources, auth: authStore, audit: auditLog, index: indexCache, shares: sharesMgr, webFS: webFS}
 	s.engine.Use(gin.Logger(), gin.Recovery())
 
 	s.engine.GET("/healthz", func(c *gin.Context) {
@@ -104,6 +106,7 @@ func New(cfgSources *source.Manager, authStore *auth.Store, auditLog *audit.Log,
 	if s.auth != nil {
 		grp.POST("/auth/bootstrap", s.bootstrap) // 仅无用户时可创建首个管理员
 		grp.POST("/auth/login", s.login)
+		grp.GET("/auth/pubkey", s.loginPubKey) // 登录密码信封加密公钥（无需登录）
 		grp.GET("/auth/status", s.authStatus) // 前端判断是否需要引导/登录
 		grp.GET("/auth/me", s.requireRole(auth.RoleAdmin, auth.RoleGuest), s.me)
 		grp.POST("/auth/users", s.requireRole(auth.RoleAdmin), s.createUser)
@@ -148,6 +151,18 @@ func New(cfgSources *source.Manager, authStore *auth.Store, auditLog *audit.Log,
 		grp.GET("/sources/:id/sync", authAny, s.syncStatus)
 		grp.POST("/sources/:id/sync", authAdmin, s.syncTrigger)
 		grp.GET("/index/status", authAny, s.indexStatus)
+	}
+
+	// —— 分享外链（M3）：管理面 admin；公开面无登录（校验在 handler 内）——
+	if s.shares != nil {
+		grp.POST("/shares", authAdmin, s.createShare)
+		grp.GET("/shares", authAdmin, s.listShares)
+		grp.DELETE("/shares/:id", authAdmin, s.deleteShare)
+
+		grp.GET("/s/:token", s.shareInfo)
+		grp.POST("/s/:token/access", s.shareAccess)
+		grp.GET("/s/:token/download", s.shareDownload)
+		grp.GET("/s/:token/raw", s.shareRaw)
 	}
 
 	// —— 前端静态资源（Vue 构建产物，web/embed.go 内嵌 dist/）——
@@ -260,8 +275,27 @@ func (s *Server) auditActionAs(c *gin.Context, action string, detail any, overri
 // —— 鉴权接口 ——
 
 type bootstrapReq struct {
-	Username string `json:"username"`
-	Password string `json:"password"`
+	Username    string `json:"username"`
+	Password    string `json:"password"`
+	PasswordEnc string `json:"password_enc"` // 信封加密密码（优先于 password）
+}
+
+// loginPubKey 返回登录密码加密公钥（SPKI PEM）。
+func (s *Server) loginPubKey(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{"alg": "RSA-OAEP-256", "public_key": string(s.auth.PublicKeyPEM())})
+}
+
+// passwordOf 取请求中的明文密码：password_enc 优先（信封解密），否则回退明文字段。
+func (s *Server) passwordOf(c *gin.Context, req *bootstrapReq) (string, bool) {
+	if req.PasswordEnc == "" {
+		return req.Password, true
+	}
+	pwd, err := s.auth.DecryptPassword(req.PasswordEnc)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"code": "INVALID_PARAM", "message": "密码密文无效或已过期，请刷新页面重试"})
+		return "", false
+	}
+	return pwd, true
 }
 
 // bootstrap 创建首个管理员：仅当系统中还没有任何用户时可用。
@@ -276,11 +310,15 @@ func (s *Server) bootstrap(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"code": "INVALID_PARAM", "message": err.Error()})
 		return
 	}
-	if err := s.auth.Create(req.Username, req.Password, auth.RoleAdmin); err != nil {
+	password, ok := s.passwordOf(c, &req)
+	if !ok {
+		return
+	}
+	if err := s.auth.Create(req.Username, password, auth.RoleAdmin); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"code": "INVALID_PARAM", "message": err.Error()})
 		return
 	}
-	tok, role, err := s.auth.Login(req.Username, req.Password, c.ClientIP())
+	tok, role, err := s.auth.Login(req.Username, password, c.ClientIP())
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"code": "INTERNAL", "message": err.Error()})
 		return
@@ -296,8 +334,12 @@ func (s *Server) login(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"code": "INVALID_PARAM", "message": err.Error()})
 		return
 	}
+	password, ok := s.passwordOf(c, &req)
+	if !ok {
+		return
+	}
 	key := req.Username + "|" + c.ClientIP()
-	tok, role, err := s.auth.Login(req.Username, req.Password, key)
+	tok, role, err := s.auth.Login(req.Username, password, key)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"code": "BAD_CREDENTIALS", "message": err.Error()})
 		return
@@ -382,14 +424,16 @@ func (s *Server) deleteUser(c *gin.Context) {
 }
 
 func (s *Server) resetPassword(c *gin.Context) {
-	var req struct {
-		Password string `json:"password"`
-	}
+	var req bootstrapReq
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"code": "INVALID_PARAM", "message": err.Error()})
 		return
 	}
-	if err := s.auth.ChangePassword(c.Param("name"), req.Password); err != nil {
+	password, ok := s.passwordOf(c, &req)
+	if !ok {
+		return
+	}
+	if err := s.auth.ChangePassword(c.Param("name"), password); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"code": "INVALID_PARAM", "message": err.Error()})
 		return
 	}

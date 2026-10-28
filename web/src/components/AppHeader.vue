@@ -1,15 +1,18 @@
 <script setup lang="ts">
 import { ref } from 'vue'
-import { Search, User, SwitchButton, Plus, Download, Upload as UploadIcon } from '@element-plus/icons-vue'
+import { useRouter } from 'vue-router'
+import { Search, User, SwitchButton, Plus, Download, Upload as UploadIcon, Share } from '@element-plus/icons-vue'
 import { useAuthStore } from '../stores/auth'
 import { useBrowseStore } from '../stores/browse'
 import { downloadHref, exportUrl } from '../api/exportHelpers'
 import SourceDialog from './SourceDialog.vue'
 import ExportDialog from './ExportDialog.vue'
 import ImportDialog from './ImportDialog.vue'
+import ThemeToggle from './ThemeToggle.vue'
 
 const auth = useAuthStore()
 const browse = useBrowseStore()
+const router = useRouter()
 
 const searchText = ref('')
 const sourceDialogVisible = ref(false)
@@ -25,6 +28,7 @@ function openAddSource() {
 }
 
 async function onLogout() {
+  browse.reset()
   await auth.logout()
 }
 
@@ -39,12 +43,12 @@ function doExportDownload(redact: boolean) {
 
 <template>
   <el-header class="app-header" height="56px">
-    <div class="brand">
+    <a class="brand" href="/">
       <span class="logo">🗂</span>
       <b>u-file</b>
-      <el-tag size="small" type="info" effect="dark">M2</el-tag>
+      <el-tag size="small" type="info" effect="dark">M3</el-tag>
       <span class="subtitle">统一文件管理服务平台</span>
-    </div>
+    </a>
 
     <el-input
       v-model="searchText"
@@ -71,7 +75,10 @@ function doExportDownload(redact: boolean) {
         </el-dropdown>
       </template>
 
+      <ThemeToggle />
+
       <template v-if="auth.isAdmin">
+        <el-button :icon="Share" @click="router.push('/shares')">分享管理</el-button>
         <el-button :icon="UploadIcon" @click="onImport">导入配置</el-button>
         <el-button :icon="Download" @click="onExport">导出配置</el-button>
         <el-button type="primary" :icon="Plus" @click="openAddSource">新增文件源</el-button>
@@ -86,21 +93,21 @@ function doExportDownload(redact: boolean) {
 
 <style scoped>
 .app-header {
-  background: #1d2935;
-  color: #e5eaf3;
+  background: var(--ufile-header-bg);
+  color: var(--ufile-header-text);
   display: flex;
   align-items: center;
   gap: 16px;
   padding: 0 20px;
 }
-.brand { display: flex; align-items: center; gap: 8px; font-size: 16px; }
+.brand { display: flex; align-items: center; gap: 8px; font-size: 16px; color: inherit; text-decoration: none; }
 .subtitle { opacity: .55; font-size: 13px; }
 .search-box { width: 240px; margin-left: auto; }
 .actions { display: flex; align-items: center; gap: 4px; }
 .user-chip {
   display: inline-flex; align-items: center; gap: 6px;
-  color: #e5eaf3; cursor: pointer; font-size: 13px; outline: none;
+  color: var(--ufile-header-text); cursor: pointer; font-size: 13px; outline: none;
   padding: 4px 8px; border-radius: 6px;
 }
-.user-chip:hover { background: rgba(255,255,255,.08); }
+.user-chip:hover { background: var(--ufile-header-hover); }
 </style>
