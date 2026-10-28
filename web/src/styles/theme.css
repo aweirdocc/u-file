@@ -1,0 +1,118 @@
+/* 主题系统：多主题色 + 暗色模式。
+ * 机制：html[data-accent='cyan'] 等选择器覆盖 --el-color-primary 及其派生变量；
+ * 暗色由 element-plus/theme-chalk/dark/css-vars.css 提供（html.dark 时全量翻转），
+ * 本文件只补充暗色下的少数定制（页面背景层次、header 配色）。
+ * 派生色按 Element Plus 官方混色算法比例（与 white/black 混合）手工计算。
+ */
+
+:root {
+  --ufile-header-bg: #1d2935;
+  --ufile-header-text: #e5eaf3;
+  --ufile-header-hover: rgba(255, 255, 255, 0.08);
+  --ufile-body-bg: #f3f5f9;
+  --ufile-card-shadow: 0 1px 3px rgba(16, 24, 40, 0.06), 0 1px 2px rgba(16, 24, 40, 0.04);
+  --ufile-radius: 10px;
+}
+
+html.dark {
+  --ufile-header-bg: #111827;
+  --ufile-header-text: #e5eaf3;
+  --ufile-header-hover: rgba(255, 255, 255, 0.1);
+  --ufile-body-bg: #0d1117;
+  --ufile-card-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
+}
+
+/* —— 主题色：blue（默认，即 Element Plus 原生值）—— */
+html[data-accent='blue'] {
+  --el-color-primary: #409eff;
+  --el-color-primary-light-3: #79bbff;
+  --el-color-primary-light-5: #a0cfff;
+  --el-color-primary-light-7: #c6e2ff;
+  --el-color-primary-light-8: #d9ecff;
+  --el-color-primary-light-9: #ecf5ff;
+  --el-color-primary-dark-2: #337ecc;
+}
+html.dark[data-accent='blue'] {
+  --el-color-primary-light-3: #3375b9;
+  --el-color-primary-light-5: #2a5f9e;
+  --el-color-primary-light-7: #213d5e;
+  --el-color-primary-light-8: #1d3251;
+  --el-color-primary-light-9: #18222c;
+  --el-color-primary-dark-2: #66b1ff;
+}
+
+/* —— cyan 清爽青 —— */
+html[data-accent='cyan'] {
+  --el-color-primary: #14b8a6;
+  --el-color-primary-light-3: #4fd1c0;
+  --el-color-primary-light-5: #89e0d5;
+  --el-color-primary-light-7: #bdf0ea;
+  --el-color-primary-light-8: #d8f6f2;
+  --el-color-primary-light-9: #ecfbf9;
+  --el-color-primary-dark-2: #109a8c;
+}
+html.dark[data-accent='cyan'] {
+  --el-color-primary-light-3: #109a8c;
+  --el-color-primary-light-5: #0d7f74;
+  --el-color-primary-light-7: #0a524d;
+  --el-color-primary-light-8: #083f3b;
+  --el-color-primary-light-9: #06211f;
+  --el-color-primary-dark-2: #4fd1c0;
+}
+
+/* —— purple 优雅紫 —— */
+html[data-accent='purple'] {
+  --el-color-primary: #8b5cf6;
+  --el-color-primary-light-3: #a982f8;
+  --el-color-primary-light-5: #c3a5fa;
+  --el-color-primary-light-7: #ddc9fd;
+  --el-color-primary-light-8: #e9dcfe;
+  --el-color-primary-light-9: #f4edfe;
+  --el-color-primary-dark-2: #734dd0;
+}
+html.dark[data-accent='purple'] {
+  --el-color-primary-light-3: #7451d1;
+  --el-color-primary-light-5: #5f43ac;
+  --el-color-primary-light-7: #3d2c71;
+  --el-color-primary-light-8: #2e2156;
+  --el-color-primary-light-9: #191230;
+  --el-color-primary-dark-2: #a982f8;
+}
+
+/* —— green 自然绿 —— */
+html[data-accent='green'] {
+  --el-color-primary: #22c55e;
+  --el-color-primary-light-3: #52d47e;
+  --el-color-primary-light-5: #85e2a4;
+  --el-color-primary-light-7: #b8f0c9;
+  --el-color-primary-light-8: #d1f5dd;
+  --el-color-primary-light-9: #e9f9ee;
+  --el-color-primary-dark-2: #1da94f;
+}
+html.dark[data-accent='green'] {
+  --el-color-primary-light-3: #1da94f;
+  --el-color-primary-light-5: #18893f;
+  --el-color-primary-light-7: #105327;
+  --el-color-primary-light-8: #0d3f1e;
+  --el-color-primary-light-9: #072012;
+  --el-color-primary-dark-2: #52d47e;
+}
+
+/* —— orange 活力橙 —— */
+html[data-accent='orange'] {
+  --el-color-primary: #f59e0b;
+  --el-color-primary-light-3: #f7b445;
+  --el-color-primary-light-5: #f9c777;
+  --el-color-primary-light-7: #fbdcaa;
+  --el-color-primary-light-8: #fce7c4;
+  --el-color-primary-light-9: #fef3e0;
+  --el-color-primary-dark-2: #cf8609;
+}
+html.dark[data-accent='orange'] {
+  --el-color-primary-light-3: #cf8609;
+  --el-color-primary-light-5: #a86c07;
+  --el-color-primary-light-7: #6a4405;
+  --el-color-primary-light-8: #503304;
+  --el-color-primary-light-9: #2a1b02;
+  --el-color-primary-dark-2: #f7b445;
+}

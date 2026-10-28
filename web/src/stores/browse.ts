@@ -56,8 +56,33 @@ export const useBrowseStore = defineStore('browse', {
     isSearching(): boolean { return this.searchQuery !== '' },
   },
   actions: {
+    /** 登出/401 后清空全部浏览状态（避免下一个会话看到上个会话的残留） */
+    reset() {
+      this.sources = []
+      this.source = ''
+      this.path = ''
+      this.pageStack = ['']
+      this.curNextCursor = ''
+      this.entries = []
+      this.loading = false
+      this.error = ''
+      this.searchQuery = ''
+      this.searchHits = []
+      this.searchLoading = false
+      this.selected = []
+      this.sourceDialogMode = null
+      this.exportDialogVisible = false
+      this.importDialogVisible = false
+      this.previewEntry = null
+    },
     /** 从 URL 恢复 source/path */
     fromRoute(source: string, path: string) {
+      // 源切换时清空条目：避免"未选中源但列表仍显示旧源文件"的陈旧状态
+      // （此时点下载/分享等行内操作会用错误的 source 发请求）
+      if (this.source !== source) {
+        this.entries = []
+        this.error = ''
+      }
       this.source = source
       this.path = path
       this.searchQuery = ''

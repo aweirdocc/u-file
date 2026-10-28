@@ -1,27 +1,44 @@
 // 后端 API 调用函数全集（与旧 UI 的 24 个调用点一一对应）。
 import { get, post, put, del, getText, upload } from './client'
+import { encryptPassword } from '../utils/crypto'
 import type {
   Source, Entry, ListResult, TestResult, ImportReport,
-  SyncStatus, SearchResponse, AuthStatus, Me, UserInfo,
+  SyncStatus, SearchResponse, AuthStatus, Me, UserInfo, ShareInfo,
 } from './types'
 
 const enc = encodeURIComponent
 
 // —— 鉴权 ——
 
+/** 获取登录密码加密公钥（SPKI PEM）。 */
+export const getLoginPubKey = () => get<{ alg: string; public_key: string }>('/api/v1/auth/pubkey')
+
+/**
+ * 构造密码提交体：优先信封加密（RSA-OAEP），浏览器不支持/失败时回退明文。
+ * 服务端两种都接受（password_enc 优先）。
+ */
+async function passwordPayload(password: string): Promise<Record<string, string>> {
+  try {
+    const { public_key } = await getLoginPubKey()
+    const password_enc = await encryptPassword(password, public_key)
+    if (password_enc) return { password: '', password_enc }
+  } catch { /* 公钥不可达：回退明文 */ }
+  return { password }
+}
+
 export const getAuthStatus = () => get<AuthStatus>('/api/v1/auth/status')
 export const getMe = () => get<Me>('/api/v1/auth/me')
-export const login = (username: string, password: string) =>
-  post<{ user: string; role: string }>('/api/v1/auth/login', { username, password })
-export const bootstrap = (username: string, password: string) =>
-  post<{ user: string; role: string }>('/api/v1/auth/bootstrap', { username, password })
+export const login = async (username: string, password: string) =>
+  post<{ user: string; role: string }>('/api/v1/auth/login', { username, ...(await passwordPayload(password)) })
+export const bootstrap = async (username: string, password: string) =>
+  post<{ user: string; role: string }>('/api/v1/auth/bootstrap', { username, ...(await passwordPayload(password)) })
 export const logout = () => post<{ ok: boolean }>('/api/v1/auth/logout')
 export const listUsers = () => get<UserInfo[]>('/api/v1/auth/users')
-export const createUser = (username: string, password: string, role: string) =>
-  post<{ user: string; role: string }>('/api/v1/auth/users', { username, password, role })
+export const createUser = async (username: string, password: string, role: string) =>
+  post<{ user: string; role: string }>('/api/v1/auth/users', { username, role, ...(await passwordPayload(password)) })
 export const deleteUser = (name: string) => del<{ ok: boolean }>(`/api/v1/auth/users/${enc(name)}`)
-export const resetPassword = (name: string, password: string) =>
-  post<{ ok: boolean }>(`/api/v1/auth/users/${enc(name)}/password`, { password })
+export const resetPassword = async (name: string, password: string) =>
+  post<{ ok: boolean }>(`/api/v1/auth/users/${enc(name)}/password`, await passwordPayload(password))
 
 // —— 源管理 ——
 
@@ -89,4 +106,14 @@ export const triggerSync = (source: string) => post<{ ok: boolean }>(`/api/v1/so
 export const search = (q: string, limit = 100) =>
   get<SearchResponse>(`/api/v1/search?q=${enc(q)}&limit=${limit}`)
 
-export type { Entry, Source }
+// —— 分享外链（管理面）——
+
+export const createShare = (sourceId: string, path: string, ttlHours: number, password: string, maxDownloads: number) =>
+  post<ShareInfo>('/api/v1/shares', { source_id: sourceId, path, ttl_hours: ttlHours, password, max_downloads: maxDownloads })
+export const listShares = () => get<ShareInfo[]>('/api/v1/shares')
+export const deleteShare = (id: string) => del<{ ok: boolean }>(`/api/v1/shares/${enc(id)}`)
+
+/** 访客页公开信息（无登录；404/410 交给调用方按状态处理） */
+export const shareUrl = (token: string) => `/s/${enc(token)}`
+
+export type { Source, Entry }

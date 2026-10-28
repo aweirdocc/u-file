@@ -4,6 +4,18 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>u-file · 统一文件管理服务平台</title>
+<script>
+// 防闪屏：Vue 挂载前按用户偏好设置主题（与 stores/settings.ts 的持久化键一致）
+(function () {
+  try {
+    var t = JSON.parse(localStorage.getItem('ufile_theme') || '{}')
+    var el = document.documentElement
+    if (t.mode === 'dark') el.classList.add('dark')
+    if (typeof t.accent === 'string') el.dataset.accent = t.accent
+    el.style.colorScheme = t.mode === 'dark' ? 'dark' : 'light'
+  } catch (e) { /* 忽略，走默认亮色 */ }
+})()
+</script>
 </head>
 <body>
 <div id="app"></div>

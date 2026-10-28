@@ -210,6 +210,12 @@ func (s *Server) archive(c *gin.Context) {
 	if name == "" || name == "." {
 		name = "download"
 	}
+	s.archiveEntries(c, src, paths, name)
+	s.auditAction(c, "file.archive", gin.H{"source": src.ID, "paths": paths, "name": name})
+}
+
+// archiveEntries 把多个路径流式打包为 zip 输出（archive 与分享目录下载共用）。
+func (s *Server) archiveEntries(c *gin.Context, src *source.Source, paths []string, name string) {
 	c.Header("Content-Type", "application/zip")
 	c.Header("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": name + ".zip"}))
 	c.Header("X-Content-Type-Options", "nosniff")
@@ -223,7 +229,6 @@ func (s *Server) archive(c *gin.Context) {
 			break
 		}
 	}
-	s.auditAction(c, "file.archive", gin.H{"source": src.ID, "paths": paths, "files": counter.n})
 }
 
 type entryCounter struct {

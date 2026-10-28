@@ -38,7 +38,7 @@ func newPreviewServer(t *testing.T) *gin.Engine {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(mgr, nil, nil, nil, testWebFS(t))
+	srv, err := New(mgr, nil, nil, nil, nil, testWebFS(t))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -2,12 +2,15 @@
 // 文件表格：el-table + 勾选列（仅可写源显示）、名称/大小/时间/操作列。
 import { computed, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { View, Download, Link, EditPen } from '@element-plus/icons-vue'
+import { View, Download, Link, EditPen, Share } from '@element-plus/icons-vue'
 import { useBrowseStore } from '../stores/browse'
+import { useAuthStore } from '../stores/auth'
 import { presign, downloadUrl, renameEntry } from '../api'
 import { fmtSize, fmtTime, fileIcon, parentOf, joinPath } from '../utils/format'
 import { previewKind } from '../utils/preview'
 import type { Entry } from '../api/types'
+import ShareDialog from './ShareDialog.vue'
+import type { ShareTarget } from './ShareDialog.vue'
 
 const emit = defineEmits<{
   navigate: [source: string, path: string]
@@ -16,9 +19,26 @@ const emit = defineEmits<{
 }>()
 
 const browse = useBrowseStore()
+const auth = useAuthStore()
 const tableRef = ref()
 
 const canWrite = computed(() => browse.canWrite)
+
+const shareDialogRef = ref<InstanceType<typeof ShareDialog>>()
+const shareVisible = ref(false)
+
+/** 分享入口：文件行 → 弹创建对话框（admin only） */
+function onShare(e: Entry) {
+  const t: ShareTarget = {
+    sourceId: browse.source,
+    path: e.path,
+    name: e.name,
+    size: e.size,
+    isDir: e.is_dir,
+  }
+  shareVisible.value = true
+  shareDialogRef.value?.open(t)
+}
 
 async function openEntry(e: Entry) {
   if (e.is_dir) emit('navigate', browse.source, e.path)
@@ -118,17 +138,19 @@ function rowKey(row: ParentRow) {
       </template>
     </el-table-column>
 
-    <el-table-column label="操作" width="220">
+    <el-table-column label="操作" width="260">
       <template #default="{ row }">
         <template v-if="!row.__parent">
           <el-button v-if="isPreviewable(row)" link type="primary" :icon="View" @click="emit('preview', row)">预览</el-button>
           <el-button link type="primary" :icon="Download" tag="a" :href="downloadUrl(browse.source, row.path)">下载</el-button>
           <el-button v-if="browse.canPresign && !row.is_dir" link type="primary" :icon="Link" @click="openPresign(row)">直链</el-button>
+          <el-button v-if="auth.isAdmin" link type="primary" :icon="Share" @click="onShare(row)">分享</el-button>
           <el-button v-if="canWrite" link type="primary" :icon="EditPen" @click="onRename(row)">重命名</el-button>
         </template>
       </template>
     </el-table-column>
   </el-table>
+  <ShareDialog ref="shareDialogRef" v-model="shareVisible" />
 </template>
 
 <style scoped>

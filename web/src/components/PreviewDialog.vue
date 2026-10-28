@@ -110,12 +110,12 @@ watch(visible, async (v) => {
 }
 .pv-body img { max-width: 100%; max-height: 76vh; object-fit: contain; }
 .pv-body video, .pv-body audio { width: 100%; }
-.pv-body iframe { width: 100%; height: 76vh; border: none; background: #fff; }
+.pv-body iframe { width: 100%; height: 76vh; border: none; background: var(--el-bg-color); }
 .pv-body pre {
   margin: 0; padding: 16px 20px; width: 100%;
   font: 12.5px/1.6 Consolas, Menlo, monospace;
   white-space: pre-wrap; word-break: break-all;
 }
-.md { padding: 20px 26px; width: 100%; background: #fff; overflow: auto; }
+.md { padding: 20px 26px; width: 100%; background: var(--el-bg-color); overflow: auto; }
 .fallback { padding: 40px; text-align: center; color: var(--el-text-color-secondary); }
 </style>
