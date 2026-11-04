@@ -1,8 +1,7 @@
 package api
 
-// M3 分享外链：管理面（admin）+ 公开访客面（无登录，组内注册不挂中间件，
-// 先例同 auth/login）。访客凭 token 访问，提取码通过后签发作用域隔离的
-// grant cookie（1 小时免输码）。下载/预览复用 serveInline / zip 打包。
+// M3 分享外链：管理面（admin 或拥有 share 权限的用户）+ 公开访客面（无登录）。
+// 访客凭 token 访问，提取码通过后签发作用域隔离的 grant cookie（1 小时免输码）。
 
 import (
 	"crypto/sha256"
@@ -13,25 +12,26 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"ufile/internal/auth"
 	"ufile/internal/share"
 )
 
 // publicShare 把存储记录转为对外视图（不暴露哈希与创建者以外的内部信息）。
 func publicShare(s *share.Share) gin.H {
 	out := gin.H{
-		"id":         s.ID,
-		"token":      s.Token,
-		"source_id":  s.SourceID,
-		"path":       s.Path,
-		"name":       s.Name,
-		"size":       s.Size,
-		"is_dir":     s.IsDir,
+		"id":           s.ID,
+		"token":        s.Token,
+		"source_id":    s.SourceID,
+		"path":         s.Path,
+		"name":         s.Name,
+		"size":         s.Size,
+		"is_dir":       s.IsDir,
 		"has_password": s.HasPassword(),
-		"expires_at": s.ExpiresAt,
-		"downloads":  s.Downloads,
-		"created_by": s.CreatedBy,
-		"created_at": s.CreatedAt,
-		"revoked":    s.Revoked,
+		"expires_at":   s.ExpiresAt,
+		"downloads":    s.Downloads,
+		"created_by":   s.CreatedBy,
+		"created_at":   s.CreatedAt,
+		"revoked":      s.Revoked,
 	}
 	if s.MaxDownloads > 0 {
 		out["max_downloads"] = s.MaxDownloads
@@ -42,8 +42,11 @@ func publicShare(s *share.Share) gin.H {
 // createShare 创建分享。请求体：
 // {"source_id","path","ttl_hours"(必填,≤720),"password"(可选),
 //  "max_downloads"(可选,0=不限)}
-// 创建时即 Stat 目标：文件不存在立刻报错，并冗余名称/大小/目录位供列表展示。
 func (s *Server) createShare(c *gin.Context) {
+	if s.auth != nil && !s.auth.CanShareAny(s.currentUsername(c)) {
+		c.JSON(http.StatusForbidden, gin.H{"code": "FORBIDDEN", "message": "权限不足：无外链分享权限"})
+		return
+	}
 	var req struct {
 		SourceID     string  `json:"source_id"`
 		Path         string  `json:"path"`
@@ -59,6 +62,9 @@ func (s *Server) createShare(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"code": "INVALID_PARAM", "message": "缺少 path"})
 		return
 	}
+	if !s.checkPathAccess(c, req.SourceID, req.Path, auth.ActionShare) {
+		return
+	}
 	src, err := s.sources.Get(req.SourceID)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"code": "SOURCE_NOT_FOUND", "message": "文件源不存在"})
@@ -69,8 +75,7 @@ func (s *Server) createShare(c *gin.Context) {
 		s.fail(c, err)
 		return
 	}
-	user, _ := c.Get("user")
-	username, _ := user.(string)
+	username := s.currentUsername(c)
 	sh, err := s.shares.Create(share.CreateInput{
 		SourceID:     src.ID,
 		Path:         req.Path,
@@ -90,23 +95,46 @@ func (s *Server) createShare(c *gin.Context) {
 	c.JSON(http.StatusCreated, publicShare(sh))
 }
 
-// listShares 分享管理列表（admin）。
+// listShares 分享管理列表（admin 查看全部；有 share 权限的用户查看自己创建的分享）。
 func (s *Server) listShares(c *gin.Context) {
+	username := s.currentUsername(c)
+	if s.auth != nil && !s.auth.CanShareAny(username) {
+		c.JSON(http.StatusForbidden, gin.H{"code": "FORBIDDEN", "message": "权限不足：无外链分享权限"})
+		return
+	}
+	admin := s.isAdmin(c)
 	list := s.shares.List()
 	out := make([]gin.H, 0, len(list))
 	for _, sh := range list {
+		if !admin && sh.CreatedBy != username {
+			continue
+		}
 		out = append(out, publicShare(sh))
 	}
 	c.JSON(http.StatusOK, out)
 }
 
-// deleteShare 撤销分享。
+// deleteShare 撤销分享（admin 可撤销任意；普通用户仅可撤销自己创建的分享）。
 func (s *Server) deleteShare(c *gin.Context) {
-	if err := s.shares.Delete(c.Param("id")); err != nil {
+	username := s.currentUsername(c)
+	if s.auth != nil && !s.auth.CanShareAny(username) {
+		c.JSON(http.StatusForbidden, gin.H{"code": "FORBIDDEN", "message": "权限不足：无外链分享权限"})
+		return
+	}
+	id := c.Param("id")
+	if !s.isAdmin(c) {
+		for _, sh := range s.shares.List() {
+			if sh.ID == id && sh.CreatedBy != username {
+				c.JSON(http.StatusForbidden, gin.H{"code": "FORBIDDEN", "message": "不能撤销他人创建的分享"})
+				return
+			}
+		}
+	}
+	if err := s.shares.Delete(id); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"code": "SHARE_NOT_FOUND", "message": "分享不存在或已删除"})
 		return
 	}
-	s.auditAction(c, "share.delete", gin.H{"id": c.Param("id")})
+	s.auditAction(c, "share.delete", gin.H{"id": id})
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
@@ -202,7 +230,6 @@ func (s *Server) shareAccess(c *gin.Context) {
 }
 
 // shareDownload 公开下载：文件流式输出（支持 Range），目录 zip 打包。
-// 计数在输出前发生（先占名额再给字节，防并发超额下载）。
 func (s *Server) shareDownload(c *gin.Context) {
 	sh, ok := s.resolveShare(c)
 	if !ok {

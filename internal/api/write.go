@@ -1,7 +1,7 @@
 package api
 
-// M2 写操作与打包下载：上传、建目录、删除（批量）、重命名、zip 流式打包。
-// 写操作仅 admin 且驱动实现 Writer；打包走流式 zip（不落盘、不整载内存）。
+// M2/M3 写操作与打包下载：上传、建目录、删除（批量）、重命名、zip 流式打包。
+// 按 ACL 策略分别校验 write / delete / read 权限；打包走流式 zip（不落盘、不整载内存）。
 
 import (
 	"archive/zip"
@@ -15,6 +15,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"ufile/internal/auth"
 	"ufile/internal/driver"
 	"ufile/internal/source"
 )
@@ -26,9 +27,10 @@ func writerOf(src *source.Source) (driver.Writer, bool) {
 }
 
 // upload multipart 上传。表单字段：file（可多个，同名字段重复）+ path（目标目录，默认根）。
-// 流式转发：gin 的 FormFile 会先把小文件落内存/临时文件（multipart 语义所限），
-// 单文件上限由 MaxMultipartMemory 控制（默认 32MB 内存阈值，超出写临时文件，不整载）。
 func (s *Server) upload(c *gin.Context) {
+	if !s.checkSourceAccess(c, c.Param("id"), auth.ActionWrite) {
+		return
+	}
 	src, ok := s.resolveSource(c)
 	if !ok {
 		return
@@ -41,6 +43,9 @@ func (s *Server) upload(c *gin.Context) {
 	dir := c.PostForm("path") // 目标目录
 	if dir == "" {
 		dir = c.Query("path")
+	}
+	if !s.checkPathAccess(c, src.ID, dir, auth.ActionWrite) {
+		return
 	}
 	form, err := c.MultipartForm()
 	if err != nil {
@@ -61,6 +66,11 @@ func (s *Server) upload(c *gin.Context) {
 			name = name[i+1:]
 		}
 		target := path.Join(dir, name)
+		if s.auth != nil && !s.auth.CanAccess(s.currentUsername(c), src.ID, target, auth.ActionWrite) {
+			results = append(results, gin.H{"file": name, "ok": false, "error": "权限不足"})
+			failCount++
+			continue
+		}
 		f, err := fh.Open()
 		if err != nil {
 			results = append(results, gin.H{"file": name, "ok": false, "error": err.Error()})
@@ -91,6 +101,9 @@ func (s *Server) upload(c *gin.Context) {
 
 // mkdir 新建目录。请求体：{"path": "a/b/c"}
 func (s *Server) mkdir(c *gin.Context) {
+	if !s.checkSourceAccess(c, c.Param("id"), auth.ActionWrite) {
+		return
+	}
 	src, ok := s.resolveSource(c)
 	if !ok {
 		return
@@ -107,6 +120,9 @@ func (s *Server) mkdir(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"code": "INVALID_PARAM", "message": "缺少 path"})
 		return
 	}
+	if !s.checkPathAccess(c, src.ID, req.Path, auth.ActionWrite) {
+		return
+	}
 	if err := w.Mkdir(c.Request.Context(), req.Path); err != nil {
 		s.fail(c, err)
 		return
@@ -120,6 +136,9 @@ func (s *Server) mkdir(c *gin.Context) {
 
 // deleteEntries 批量删除。请求体：{"paths": ["a", "b/c"]}（目录递归删）。
 func (s *Server) deleteEntries(c *gin.Context) {
+	if !s.checkSourceAccess(c, c.Param("id"), auth.ActionDelete) {
+		return
+	}
 	src, ok := s.resolveSource(c)
 	if !ok {
 		return
@@ -135,6 +154,11 @@ func (s *Server) deleteEntries(c *gin.Context) {
 	if err := c.ShouldBindJSON(&req); err != nil || len(req.Paths) == 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"code": "INVALID_PARAM", "message": "缺少 paths"})
 		return
+	}
+	for _, p := range req.Paths {
+		if !s.checkPathAccess(c, src.ID, p, auth.ActionDelete) {
+			return
+		}
 	}
 	results := make([]gin.H, 0, len(req.Paths))
 	okCount, failCount := 0, 0
@@ -162,6 +186,9 @@ func (s *Server) deleteEntries(c *gin.Context) {
 
 // renameEntry 重命名/移动。请求体：{"from": "a/old.txt", "to": "b/new.txt"}
 func (s *Server) renameEntry(c *gin.Context) {
+	if !s.checkSourceAccess(c, c.Param("id"), auth.ActionWrite) {
+		return
+	}
 	src, ok := s.resolveSource(c)
 	if !ok {
 		return
@@ -179,6 +206,13 @@ func (s *Server) renameEntry(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"code": "INVALID_PARAM", "message": "需要 from 与 to"})
 		return
 	}
+	// 两端校验：防止把授权目录内的文件移出到未授权目录，或移动未授权目录的文件
+	if !s.checkPathAccess(c, src.ID, req.From, auth.ActionWrite) {
+		return
+	}
+	if !s.checkPathAccess(c, src.ID, req.To, auth.ActionWrite) {
+		return
+	}
 	if err := w.Rename(c.Request.Context(), req.From, req.To); err != nil {
 		s.fail(c, err)
 		return
@@ -194,6 +228,9 @@ func (s *Server) renameEntry(c *gin.Context) {
 // GET /archive?paths=a.txt&paths=docs/&name=backup —— paths 可多个；
 // 以 / 结尾或 Stat 为目录的条目递归打包（目录递归上限 10000 文件/2GB，防失控）。
 func (s *Server) archive(c *gin.Context) {
+	if !s.checkSourceAccess(c, c.Param("id"), auth.ActionRead) {
+		return
+	}
 	src, ok := s.resolveSource(c)
 	if !ok {
 		return
@@ -202,6 +239,11 @@ func (s *Server) archive(c *gin.Context) {
 	if len(paths) == 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"code": "INVALID_PARAM", "message": "缺少 paths"})
 		return
+	}
+	for _, p := range paths {
+		if !s.checkPathAccess(c, src.ID, p, auth.ActionRead) {
+			return
+		}
 	}
 	name := strings.TrimSuffix(path.Base(c.Query("name")), ".zip")
 	if name == "" {

@@ -21,7 +21,11 @@ export function parentOf(p: string): string {
 
 /** 文件图标（旧 icon() 对齐） */
 export function fileIcon(name: string): string {
-  if (/\.(jpe?g|png|gif|webp|svg|bmp|ico)$/i.test(name)) return '🖼'
+  if (/\.(jpe?g|png|gif|webp|svg|bmp|ico|avif)$/i.test(name)) return '🖼'
+  if (/\.docx?$/i.test(name)) return '📘'
+  if (/\.xlsx?$/i.test(name)) return '📗'
+  if (/\.pptx?$/i.test(name)) return '📙'
+  if (/\.pdf$/i.test(name)) return '📕'
   if (/\.(mp4|mkv|avi|mov|flv)$/i.test(name)) return '🎬'
   if (/\.(mp3|flac|wav|ogg|m4a)$/i.test(name)) return '🎵'
   if (/\.(zip|rar|7z|tar|gz|bz2)$/i.test(name)) return '🗜'

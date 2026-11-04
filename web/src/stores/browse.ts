@@ -1,4 +1,4 @@
-// 浏览状态：当前源/路径、游标分页栈、源列表、搜索模式、同步状态。
+// 浏览状态：当前源/路径、游标分页栈、源列表、搜索模式、同步状态与细粒度权限判断。
 import { defineStore } from 'pinia'
 import * as api from '../api'
 import type { Source, Entry, SearchHit } from '../api/types'
@@ -23,7 +23,7 @@ export const useBrowseStore = defineStore('browse', {
     searchQuery: '',
     searchHits: [] as SearchHit[],
     searchLoading: false,
-    /** 勾选的路径（仅 admin + write 能力源） */
+    /** 勾选的路径 */
     selected: [] as string[],
     /** 弹窗控制 */
     sourceDialogMode: null as null | { edit?: string }, // null=关闭；{edit}=编辑；{}=新增
@@ -33,9 +33,45 @@ export const useBrowseStore = defineStore('browse', {
   }),
   getters: {
     currentSource: (s) => s.sources.find(x => x.id === s.source) || null,
+    /** 当前源对当前用户的单一限制根路径前缀（仅单目录锁定时非空；全选或多目录时为空） */
+    rootPrefix(): string {
+      const acc = this.currentSource?.access
+      if (!acc) return ''
+      if (acc.path_prefixes && acc.path_prefixes.length === 1) return acc.path_prefixes[0]
+      if (acc.path_prefixes && acc.path_prefixes.length > 1) return ''
+      return acc.path_prefix || ''
+    },
+    /** 当前所在目录是否在用户直接授权的目录内（多目录勾选时公共父目录仅做导航，不可直接写） */
+    isInAllowedPath(): boolean {
+      const acc = this.currentSource?.access
+      if (!acc) return true
+      const pfxs = acc.path_prefixes?.length
+        ? acc.path_prefixes
+        : acc.path_prefix ? [acc.path_prefix] : []
+      if (!pfxs.length) return true
+      const cur = this.path
+      return pfxs.some(p => cur === p || cur.startsWith(p + '/'))
+    },
     canWrite(): boolean {
       const auth = useAuthStore()
-      return auth.isAdmin && !!this.currentSource?.capabilities.write
+      const src = this.currentSource
+      if (!src || !src.capabilities.write || !this.isInAllowedPath) return false
+      if (src.access) return src.access.actions.includes('write')
+      return auth.isAdmin
+    },
+    canDelete(): boolean {
+      const auth = useAuthStore()
+      const src = this.currentSource
+      if (!src || !src.capabilities.write || !this.isInAllowedPath) return false
+      if (src.access) return src.access.actions.includes('delete')
+      return auth.isAdmin
+    },
+    canShare(): boolean {
+      const auth = useAuthStore()
+      const src = this.currentSource
+      if (!src || !this.isInAllowedPath) return false
+      if (src.access) return src.access.actions.includes('share')
+      return auth.isAdmin
     },
     canPresign(): boolean {
       return !!this.currentSource?.capabilities.presign_url
@@ -44,9 +80,15 @@ export const useBrowseStore = defineStore('browse', {
       return !!this.currentSource?.capabilities.list_cursor
     },
     breadcrumbs(): Crumb[] {
-      const crumbs: Crumb[] = [{ name: this.source, path: '' }]
-      let acc = ''
-      for (const seg of this.path.split('/').filter(Boolean)) {
+      const rootPfx = this.rootPrefix
+      const rootLabel = rootPfx ? `${this.source} (${rootPfx})` : this.source
+      const crumbs: Crumb[] = [{ name: rootLabel, path: rootPfx }]
+      if (!this.path || this.path === rootPfx) return crumbs
+      const rel = rootPfx && this.path.startsWith(rootPfx + '/')
+        ? this.path.slice(rootPfx.length + 1)
+        : this.path
+      let acc = rootPfx
+      for (const seg of rel.split('/').filter(Boolean)) {
         acc += (acc ? '/' : '') + seg
         crumbs.push({ name: seg, path: acc })
       }
@@ -77,8 +119,6 @@ export const useBrowseStore = defineStore('browse', {
     },
     /** 从 URL 恢复 source/path */
     fromRoute(source: string, path: string) {
-      // 源切换时清空条目：避免"未选中源但列表仍显示旧源文件"的陈旧状态
-      // （此时点下载/分享等行内操作会用错误的 source 发请求）
       if (this.source !== source) {
         this.entries = []
         this.error = ''
@@ -90,14 +130,24 @@ export const useBrowseStore = defineStore('browse', {
       this.curNextCursor = ''
       this.selected = []
     },
+    /** 确保当前路径不越出源的授权路径前缀 */
+    alignPathToPrefix() {
+      const pfx = this.rootPrefix
+      if (!pfx) return
+      if (!this.path || (this.path !== pfx && !this.path.startsWith(pfx + '/'))) {
+        this.path = pfx
+      }
+    },
     /** 导航（替代旧 nav()）；URL 由组件层用 router 同步 */
     async navigate(source: string, path: string) {
       this.fromRoute(source, path)
       await this.loadSources()
+      this.alignPathToPrefix()
       await this.loadEntries()
     },
     async refresh() {
       await this.loadSources()
+      this.alignPathToPrefix()
       await this.loadEntries(true)
     },
     async loadSources() {
@@ -110,6 +160,7 @@ export const useBrowseStore = defineStore('browse', {
     },
     async loadEntries(refresh = false) {
       if (!this.source || this.isSearching) return
+      this.alignPathToPrefix()
       this.loading = true
       this.error = ''
       try {

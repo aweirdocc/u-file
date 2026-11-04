@@ -1,6 +1,6 @@
 <script setup lang="ts">
 // 工具栏：上传（多文件）/ 新建文件夹 / 已选计数 / 打包下载选中 / 删除选中。
-// 仅 admin 且当前源有 write 能力时渲染。
+// 按当前源的能力位与用户细粒度权限（write / delete）动态控制按钮显隐。
 import { computed, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Upload, FolderAdd, Box, Delete } from '@element-plus/icons-vue'
@@ -14,8 +14,10 @@ const browse = useBrowseStore()
 const uploading = ref(false)
 const fileInput = ref<HTMLInputElement>()
 
-const visible = computed(() => browse.canWrite && !!browse.source)
+const canWrite = computed(() => browse.canWrite)
+const canDelete = computed(() => browse.canDelete)
 const selectedCount = computed(() => browse.selected.length)
+const visible = computed(() => (canWrite.value || canDelete.value || selectedCount.value > 0) && !!browse.source)
 
 function pickFiles() {
   fileInput.value?.click()
@@ -99,21 +101,23 @@ async function onDeleteSelected() {
 
 <template>
   <div v-if="visible" class="toolbar">
-    <el-button type="primary" :icon="Upload" :loading="uploading" @click="pickFiles">
-      {{ uploading ? '上传中…' : '上传' }}
-    </el-button>
-    <input
-      ref="fileInput"
-      type="file"
-      multiple
-      style="display: none"
-      @change="onFilesChosen"
-    >
-    <el-button :icon="FolderAdd" @click="onMkdir">新建文件夹</el-button>
+    <template v-if="canWrite">
+      <el-button type="primary" :icon="Upload" :loading="uploading" @click="pickFiles">
+        {{ uploading ? '上传中…' : '上传' }}
+      </el-button>
+      <input
+        ref="fileInput"
+        type="file"
+        multiple
+        style="display: none"
+        @change="onFilesChosen"
+      >
+      <el-button :icon="FolderAdd" @click="onMkdir">新建文件夹</el-button>
+    </template>
     <span class="spacer" />
     <span v-if="selectedCount" class="sel-info">已选 {{ selectedCount }} 项</span>
     <el-button v-if="selectedCount" :icon="Box" @click="onArchive">打包下载选中</el-button>
-    <el-button v-if="selectedCount" type="danger" :icon="Delete" @click="onDeleteSelected">
+    <el-button v-if="selectedCount && canDelete" type="danger" :icon="Delete" @click="onDeleteSelected">
       删除选中{{ selectedCount > 1 ? `（${selectedCount}）` : '' }}
     </el-button>
   </div>

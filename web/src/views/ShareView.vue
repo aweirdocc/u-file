@@ -1,12 +1,15 @@
 <script setup lang="ts">
-// 公开分享页（/s/:token，无需登录）：展示文件信息 → 需要时输入提取码 → 下载/预览。
+// 公开分享页（/s/:token，无需登录）：展示文件信息 → 需要时输入提取码 → 下载/在线预览（支持图片缩略图加速与 docx/xlsx/pptx 在线查看）。
 // 自建简洁布局，不依赖 AppHeader；接口走原生 fetch（不受 401 登录拦截影响）。
 import { computed, onMounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { Download, View } from '@element-plus/icons-vue'
 import { fmtSize, fileIcon } from '../utils/format'
+import { previewKind, isThumbable, isOfficeKind } from '../utils/preview'
+import type { OfficeResult } from '../api/types'
 import ThemeToggle from '../components/ThemeToggle.vue'
+import OfficeViewer from '../components/OfficeViewer.vue'
 import { useSettingsStore } from '../stores/settings'
 
 interface ShareViewData {
@@ -34,15 +37,31 @@ const password = ref('')
 const unlocking = ref(false)
 const downloading = ref(false)
 
+const pvOpen = ref(false)
+const pvLoading = ref(false)
+const officeData = ref<OfficeResult | null>(null)
+const showOriginalImg = ref(false)
+
 const unlocked = computed(() => !!info.value && (!info.value.has_password || info.value.unlocked))
 
-const previewable = computed(() => {
-  if (!info.value || info.value.is_dir) return false
-  const ext = info.value.name.toLowerCase().match(/\.[a-z0-9]+$/)?.[0] || ''
-  return ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg', '.bmp', '.ico', '.avif',
-    '.mp4', '.webm', '.mov', '.mkv', '.m4v',
-    '.mp3', '.wav', '.ogg', '.flac', '.m4a', '.aac',
-    '.pdf', '.md', '.markdown', '.txt', '.csv', '.log', '.json', '.xml', '.yaml', '.yml'].includes(ext)
+const pvKind = computed(() => {
+  if (!info.value || info.value.is_dir) return ''
+  return previewKind(info.value.name)
+})
+
+const previewable = computed(() => pvKind.value !== '')
+
+const isLargeThumbableImage = computed(() => {
+  if (!info.value || pvKind.value !== 'image') return false
+  return info.value.size > 512 * 1024 && isThumbable(info.value.name)
+})
+
+const imagePreviewSrc = computed(() => {
+  const t = encodeURIComponent(token.value)
+  if (isLargeThumbableImage.value && !showOriginalImg.value) {
+    return `/api/v1/s/${t}/thumb?w=960&h=960&q=82`
+  }
+  return `/api/v1/s/${t}/raw`
 })
 
 async function load() {
@@ -95,7 +114,6 @@ async function onUnlock() {
 async function onDownload() {
   downloading.value = true
   try {
-    // 先探测：带 cookie 导航若失败（如超次），后端返回 JSON 而非文件流
     const res = await fetch(`/api/v1/s/${encodeURIComponent(token.value)}/download`)
     if (!res.ok) {
       const data = await res.json().catch(() => ({}))
@@ -103,7 +121,6 @@ async function onDownload() {
       if (res.status === 404 || res.status === 410) await load()
       return
     }
-    // 经 blob 中转下载，保证能读到错误并统一命名
     const blob = await res.blob()
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
@@ -111,7 +128,6 @@ async function onDownload() {
     a.download = info.value?.name || 'download'
     a.click()
     URL.revokeObjectURL(url)
-    // 计数变了，刷新展示
     if (info.value && !info.value.is_dir) info.value.downloads++
   } catch {
     ElMessage.error('下载失败，请重试')
@@ -120,7 +136,30 @@ async function onDownload() {
   }
 }
 
-function onPreview() {
+async function onPreview() {
+  const k = pvKind.value
+  if (isOfficeKind(k)) {
+    pvOpen.value = true
+    pvLoading.value = true
+    officeData.value = null
+    try {
+      const res = await fetch(`/api/v1/s/${encodeURIComponent(token.value)}/office`)
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(data.message || '文档解析失败')
+      officeData.value = data
+    } catch (e: any) {
+      ElMessage.error(e.message || '预览加载失败')
+      pvOpen.value = false
+    } finally {
+      pvLoading.value = false
+    }
+    return
+  }
+  if (k === 'image' || k === 'svg') {
+    showOriginalImg.value = false
+    pvOpen.value = true
+    return
+  }
   window.open(`/api/v1/s/${encodeURIComponent(token.value)}/raw`, '_blank')
 }
 
@@ -132,7 +171,7 @@ onMounted(load)
     <div class="theme-corner">
       <ThemeToggle />
     </div>
-    <div class="share-card">
+    <div class="share-card" :class="{ wide: pvOpen }">
       <div class="brand">🗂 u-file 分享</div>
 
       <!-- 加载中 -->
@@ -153,7 +192,13 @@ onMounted(load)
       <!-- 正常 -->
       <template v-else-if="info">
         <div class="file-head">
-          <span class="icon">{{ info.is_dir ? '📁' : fileIcon(info.name) }}</span>
+          <img
+            v-if="unlocked && !info.is_dir && isThumbable(info.name)"
+            :src="`/api/v1/s/${encodeURIComponent(token)}/thumb?w=120&h=120`"
+            class="head-thumb"
+            :alt="info.name"
+          >
+          <span v-else class="icon">{{ info.is_dir ? '📁' : fileIcon(info.name) }}</span>
           <div>
             <div class="name">{{ info.name }}</div>
             <div class="muted small">
@@ -185,6 +230,20 @@ onMounted(load)
           </el-button>
           <el-button v-if="previewable" size="large" :icon="View" @click="onPreview">在线预览</el-button>
         </div>
+
+        <!-- 内联预览面板（支持图片智能缩略图 + docx/xlsx/pptx 在线查看） -->
+        <div v-if="unlocked && pvOpen" v-loading="pvLoading" class="inline-pv-box">
+          <div v-if="pvKind === 'image' || pvKind === 'svg'" class="img-pv-wrap">
+            <div v-if="isLargeThumbableImage && !showOriginalImg" class="thumb-banner">
+              ⚡ 已加载动态缩放预览图，节省流量
+              <el-button link type="primary" size="small" @click="showOriginalImg = true">
+                查看原图 ({{ fmtSize(info.size) }})
+              </el-button>
+            </div>
+            <img :src="imagePreviewSrc" :alt="info.name" class="pv-img">
+          </div>
+          <OfficeViewer v-else-if="officeData" :data="officeData" />
+        </div>
       </template>
     </div>
 
@@ -198,7 +257,7 @@ onMounted(load)
   display: flex;
   flex-direction: column;
   align-items: center;
-  padding-top: 10vh;
+  padding: 8vh 16px 32px;
   background:
     radial-gradient(1000px 500px at 85% -10%, var(--el-color-primary-light-9), transparent 60%),
     var(--ufile-body-bg);
@@ -212,6 +271,10 @@ onMounted(load)
   border-radius: var(--ufile-radius);
   box-shadow: var(--ufile-card-shadow);
   padding: 28px 32px;
+  transition: width 0.2s;
+}
+.share-card.wide {
+  width: 980px;
 }
 .brand { font-size: 15px; font-weight: 600; margin-bottom: 20px; color: var(--el-text-color-primary); }
 .center { text-align: center; padding: 40px 0; }
@@ -219,10 +282,36 @@ onMounted(load)
 .small { font-size: 12px; }
 .file-head { display: flex; gap: 12px; align-items: center; margin-bottom: 20px; }
 .file-head .icon { font-size: 34px; }
+.head-thumb {
+  width: 48px;
+  height: 48px;
+  object-fit: cover;
+  border-radius: 6px;
+  border: 1px solid var(--el-border-color-lighter);
+}
 .file-head .name { font-size: 16px; font-weight: 600; word-break: break-all; }
 .unlock-box { border-top: 1px dashed var(--el-border-color); padding-top: 16px; }
 .unlock-box p { margin: 0 0 10px; }
 .unlock-row { display: flex; gap: 10px; }
 .ops { display: flex; gap: 4px; border-top: 1px dashed var(--el-border-color); padding-top: 20px; }
+.inline-pv-box {
+  margin-top: 20px;
+  padding-top: 16px;
+  border-top: 1px solid var(--el-border-color-lighter);
+}
+.img-pv-wrap {
+  text-align: center;
+}
+.thumb-banner {
+  margin-bottom: 10px;
+  font-size: 12.5px;
+  color: var(--el-text-color-secondary);
+}
+.pv-img {
+  max-width: 100%;
+  max-height: 70vh;
+  border-radius: 6px;
+  object-fit: contain;
+}
 .home-link { color: var(--el-color-primary); text-decoration: none; }
 </style>

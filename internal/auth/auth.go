@@ -1,8 +1,9 @@
-// Package auth M1 鉴权：单管理员 + 可选只读访客（P0 安全基线）。
+// Package auth M1/M3 鉴权与细粒度权限控制：
 //
 // 组成：
 //   - Store：用户存于 data/users.json，密码 bcrypt 哈希；首次启动无用户时
-//     由引导接口创建管理员（bootstrap token 落在日志里，防止裸奔窗口被抢注）；
+//     由引导接口创建管理员；支持 admin（全权）、user（按 ACL 策略授权）、guest（只读）；
+//   - ACL：源级与路径前缀级访问控制（read / write / delete / share），见 acl.go；
 //   - JWT：HS256，Claims 含角色；不引入外部 JWT 库，HMAC 由标准库实现；
 //   - limiter：登录失败限速（按 用户名+来源IP，指数退避）。
 package auth
@@ -27,31 +28,47 @@ import (
 
 var (
 	ErrBadCredentials  = errors.New("auth: 用户名或密码错误")
+	ErrUserDisabled    = errors.New("auth: 账号已被禁用，请联系管理员")
 	ErrNoUsers         = errors.New("auth: 尚未创建管理员")
 	ErrUserExists      = errors.New("auth: 用户已存在")
-	ErrLastAdmin       = errors.New("auth: 不能删除最后一个管理员")
+	ErrLastAdmin       = errors.New("auth: 不能删除或禁用最后一个管理员")
 	ErrRateLimited     = errors.New("auth: 尝试次数过多，请稍后再试")
 	ErrTokenInvalid    = errors.New("auth: 会话无效或已过期")
 	ErrBootstrapNeeded = errors.New("auth: 需要引导令牌才能创建首个管理员")
 )
 
-// Role 用户角色：admin 全权；guest 只读（浏览/下载/预览）。
+// Role 用户角色：admin 全权；user 按 ACL 授权；guest 只读（浏览/下载/预览）。
 type Role string
 
 const (
 	RoleAdmin Role = "admin"
+	RoleUser  Role = "user"
 	RoleGuest Role = "guest"
 )
+
+// ValidRole 校验角色是否合法。
+func ValidRole(r Role) bool {
+	switch r {
+	case RoleAdmin, RoleUser, RoleGuest:
+		return true
+	default:
+		return false
+	}
+}
 
 const tokenTTL = 24 * time.Hour
 
 // —— 用户存储 ——
 
 type storedUser struct {
-	Name      string `json:"name"`
-	Hash      string `json:"hash"` // bcrypt
-	Role      Role   `json:"role"`
+	Name      string    `json:"name"`
+	Hash      string    `json:"hash"` // bcrypt
+	Role      Role      `json:"role"`
+	Disabled  bool      `json:"disabled,omitempty"`
+	Remark    string    `json:"remark,omitempty"`
+	Policies  []Policy  `json:"policies,omitempty"`
 	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at,omitempty"`
 }
 
 type user struct {
@@ -61,11 +78,11 @@ type user struct {
 
 // Store 用户存储 + JWT 签发 + 登录密码解密。
 type Store struct {
-	mu    sync.RWMutex
-	file  string // data/users.json
+	mu     sync.RWMutex
+	file   string // data/users.json
 	secret []byte // JWT 签名密钥（data/jwt.key，独立于凭据主密钥）
-	users map[string]*user
-	order []string
+	users  map[string]*user
+	order  []string
 
 	limiter *limiter
 
@@ -122,36 +139,14 @@ func (s *Store) HasUsers() bool {
 
 // Create 创建用户（首个用户必须是 admin）。
 func (s *Store) Create(name, password string, role Role) error {
-	if len(name) < 2 || len(name) > 64 {
-		return fmt.Errorf("auth: 用户名长度需 2~64")
-	}
-	if len(password) < 8 {
-		return errors.New("auth: 密码至少 8 位")
-	}
-	if role != RoleAdmin && role != RoleGuest {
-		return fmt.Errorf("auth: 未知角色 %q", role)
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, dup := s.users[name]; dup {
-		return ErrUserExists
-	}
-	if len(s.users) == 0 && role != RoleAdmin {
-		return errors.New("auth: 首个用户必须为管理员")
-	}
-	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
-	if err != nil {
-		return err
-	}
-	u := &user{storedUser: storedUser{
-		Name: name, Hash: string(hash), Role: role, CreatedAt: time.Now(),
-	}, hash: hash}
-	s.users[name] = u
-	s.order = append(s.order, name)
-	return s.saveLocked()
+	return s.CreateWithOptions(CreateUserOptions{
+		Name:     name,
+		Password: password,
+		Role:     role,
+	})
 }
 
-// Remove 删除用户（不允许删掉最后一个管理员）。
+// Remove 删除用户（不允许删掉最后一个启用中的管理员）。
 func (s *Store) Remove(name string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -159,14 +154,8 @@ func (s *Store) Remove(name string) error {
 	if !ok {
 		return ErrBadCredentials
 	}
-	if u.Role == RoleAdmin {
-		n := 0
-		for _, x := range s.users {
-			if x.Role == RoleAdmin {
-				n++
-			}
-		}
-		if n <= 1 {
+	if u.Role == RoleAdmin && !u.Disabled {
+		if s.activeAdminCountLocked(name) == 0 {
 			return ErrLastAdmin
 		}
 	}
@@ -197,6 +186,7 @@ func (s *Store) ChangePassword(name, newPassword string) error {
 	}
 	u.Hash = string(hash)
 	u.hash = hash
+	u.UpdatedAt = time.Now()
 	return s.saveLocked()
 }
 
@@ -240,9 +230,11 @@ func (s *Store) Login(name, password, key string) (token string, role Role, err 
 	u, ok := s.users[name]
 	var hash []byte
 	var role2 Role
+	var disabled bool
 	if ok {
 		hash = u.hash
 		role2 = u.Role
+		disabled = u.Disabled
 	}
 	s.mu.RUnlock()
 	// 用户不存在也做一次 bcrypt 比较，抹平时序差异
@@ -257,6 +249,9 @@ func (s *Store) Login(name, password, key string) (token string, role Role, err 
 		s.limiter.Fail(key)
 		return "", "", ErrBadCredentials
 	}
+	if disabled {
+		return "", "", ErrUserDisabled
+	}
 	s.limiter.Reset(key)
 	tok, err := s.sign(name, role2)
 	if err != nil {
@@ -267,10 +262,10 @@ func (s *Store) Login(name, password, key string) (token string, role Role, err 
 
 // Claims JWT 载荷。
 type Claims struct {
-	Sub   string `json:"sub"`
-	Role  Role   `json:"role"`
-	Exp   int64  `json:"exp"`
-	Iat   int64  `json:"iat"`
+	Sub  string `json:"sub"`
+	Role Role   `json:"role"`
+	Exp  int64  `json:"exp"`
+	Iat  int64  `json:"iat"`
 }
 
 // sign 签发 HS256 JWT。
@@ -315,9 +310,14 @@ func (s *Store) Verify(token string) (*Claims, error) {
 	if time.Now().Unix() >= cl.Exp {
 		return nil, ErrTokenInvalid
 	}
-	if _, ok := s.users[cl.Sub]; !ok {
-		return nil, ErrTokenInvalid // 用户已被删除
+	s.mu.RLock()
+	u, ok := s.users[cl.Sub]
+	if !ok || u.Disabled {
+		s.mu.RUnlock()
+		return nil, ErrTokenInvalid // 用户已被删除或已禁用
 	}
+	cl.Role = u.Role // 实时同步最新角色
+	s.mu.RUnlock()
 	return &cl, nil
 }
 

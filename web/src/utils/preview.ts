@@ -1,7 +1,7 @@
 // 预览类型判定 + 内置无依赖 Markdown 渲染器（从旧 UI 迁移，逻辑不变：先整体
 // HTML 转义再套标签，无 XSS 面）。
 
-export type PreviewKind = 'image' | 'svg' | 'video' | 'audio' | 'pdf' | 'md' | 'text' | ''
+export type PreviewKind = 'image' | 'svg' | 'video' | 'audio' | 'pdf' | 'docx' | 'xlsx' | 'pptx' | 'md' | 'text' | ''
 
 const PV_KINDS: [PreviewKind, RegExp][] = [
   ['image', /\.(jpe?g|png|gif|webp|bmp|ico|avif)$/i],
@@ -9,9 +9,21 @@ const PV_KINDS: [PreviewKind, RegExp][] = [
   ['video', /\.(mp4|webm|mov|m4v)$/i], // mkv 编码不定，多数浏览器放不了，走 fallback
   ['audio', /\.(mp3|wav|ogg|flac|m4a|aac)$/i],
   ['pdf', /\.pdf$/i],
+  ['docx', /\.docx$/i],
+  ['xlsx', /\.xlsx$/i],
+  ['pptx', /\.pptx$/i],
   ['md', /\.(md|markdown)$/i],
   ['text', /\.(txt|csv|log|json|ya?ml|toml|ini|xml|html?|css|go|js|mjs|ts|py|java|c|h|cpp|rs|sh|sql|bat|ps1|diff|env)$/i],
 ]
+
+/** 判断图片格式是否支持后端动态缩放缩略图（避免直接加载数 MB 原图） */
+export function isThumbable(name: string): boolean {
+  return /\.(jpe?g|png|gif|bmp)$/i.test(name)
+}
+
+export function isOfficeKind(k: PreviewKind): k is 'docx' | 'xlsx' | 'pptx' {
+  return k === 'docx' || k === 'xlsx' || k === 'pptx'
+}
 
 export function previewKind(name: string): PreviewKind {
   for (const [k, re] of PV_KINDS) if (re.test(name)) return k

@@ -1,14 +1,15 @@
-// 后端 API 调用函数全集（与旧 UI 的 24 个调用点一一对应）。
+// 后端 API 调用函数全集。
 import { get, post, put, del, getText, upload } from './client'
 import { encryptPassword } from '../utils/crypto'
 import type {
   Source, Entry, ListResult, TestResult, ImportReport,
-  SyncStatus, SearchResponse, AuthStatus, Me, UserInfo, ShareInfo,
+  SyncStatus, SearchResponse, AuthStatus, Me, UserInfo,
+  CreateUserInput, UpdateUserInput, Policy, ShareInfo, OfficeResult,
 } from './types'
 
 const enc = encodeURIComponent
 
-// —— 鉴权 ——
+// —— 鉴权与用户管理 ——
 
 /** 获取登录密码加密公钥（SPKI PEM）。 */
 export const getLoginPubKey = () => get<{ alg: string; public_key: string }>('/api/v1/auth/pubkey')
@@ -33,9 +34,21 @@ export const login = async (username: string, password: string) =>
 export const bootstrap = async (username: string, password: string) =>
   post<{ user: string; role: string }>('/api/v1/auth/bootstrap', { username, ...(await passwordPayload(password)) })
 export const logout = () => post<{ ok: boolean }>('/api/v1/auth/logout')
+
 export const listUsers = () => get<UserInfo[]>('/api/v1/auth/users')
-export const createUser = async (username: string, password: string, role: string) =>
-  post<{ user: string; role: string }>('/api/v1/auth/users', { username, role, ...(await passwordPayload(password)) })
+export const createUser = async (input: CreateUserInput) =>
+  post<UserInfo>('/api/v1/auth/users', {
+    username: input.username,
+    role: input.role,
+    disabled: input.disabled ?? false,
+    remark: input.remark ?? '',
+    policies: input.policies ?? [],
+    ...(await passwordPayload(input.password)),
+  })
+export const updateUser = (name: string, input: UpdateUserInput) =>
+  put<UserInfo>(`/api/v1/auth/users/${enc(name)}`, input)
+export const updateUserPolicies = (name: string, policies: Policy[]) =>
+  put<{ ok: boolean; policies: Policy[] }>(`/api/v1/auth/users/${enc(name)}/policies`, { policies })
 export const deleteUser = (name: string) => del<{ ok: boolean }>(`/api/v1/auth/users/${enc(name)}`)
 export const resetPassword = async (name: string, password: string) =>
   post<{ ok: boolean }>(`/api/v1/auth/users/${enc(name)}/password`, await passwordPayload(password))
@@ -87,6 +100,14 @@ export const downloadUrl = (source: string, path: string) =>
   `/api/v1/sources/${enc(source)}/download?path=${enc(path)}`
 export const rawUrl = (source: string, path: string) =>
   `/api/v1/sources/${enc(source)}/raw?path=${enc(path)}`
+export const thumbUrl = (source: string, path: string, w = 200, h = 200, q = 78) =>
+  `/api/v1/sources/${enc(source)}/thumb?path=${enc(path)}&w=${w}&h=${h}&q=${q}`
+export const getOfficePreview = (source: string, path: string) =>
+  get<OfficeResult>(`/api/v1/sources/${enc(source)}/office?path=${enc(path)}`)
+export const shareThumbUrl = (token: string, w = 200, h = 200, q = 78) =>
+  `/api/v1/s/${enc(token)}/thumb?w=${w}&h=${h}&q=${q}`
+export const getShareOfficePreview = (token: string) =>
+  get<OfficeResult>(`/api/v1/s/${enc(token)}/office`)
 export const archiveUrl = (source: string, paths: string[], name: string) =>
   `/api/v1/sources/${enc(source)}/archive?${paths.map(p => 'paths=' + enc(p)).join('&')}&name=${enc(name)}`
 export async function presign(source: string, path: string): Promise<{ url: string; expires_in: number }> {

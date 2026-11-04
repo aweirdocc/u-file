@@ -1,8 +1,8 @@
-// 鉴权状态：token（sessionStorage）、当前用户、角色、登录跳转。
+// 鉴权状态：token（sessionStorage）、当前用户、角色、细粒度权限策略、登录跳转。
 import { defineStore } from 'pinia'
 import { getToken, setToken, setUnauthorizedHandler } from '../api/client'
 import * as api from '../api'
-import type { Role } from '../api/types'
+import type { Role, Policy } from '../api/types'
 import router from '../router'
 
 export const useAuthStore = defineStore('auth', {
@@ -10,6 +10,8 @@ export const useAuthStore = defineStore('auth', {
     token: getToken(),
     user: '',
     role: '' as Role,
+    canShare: false,
+    policies: [] as Policy[],
     /** null=未初始化；true=无用户需引导；false=正常登录 */
     needsBootstrap: null as boolean | null,
     /** 401 前的页面路径，登录成功后回跳 */
@@ -18,7 +20,7 @@ export const useAuthStore = defineStore('auth', {
   getters: {
     isLoggedIn: (s) => !!s.token && !!s.user,
     isAdmin: (s) => s.role === 'admin',
-    roleLabel: (s) => (s.role === 'admin' ? '管理员' : s.role === 'guest' ? '只读' : ''),
+    roleLabel: (s) => (s.role === 'admin' ? '管理员' : s.role === 'user' ? '协作员' : s.role === 'guest' ? '只读' : ''),
   },
   actions: {
     /** 注册 401 全局拦截 → 跳登录页（带回跳地址） */
@@ -27,6 +29,8 @@ export const useAuthStore = defineStore('auth', {
         this.token = ''
         this.user = ''
         this.role = ''
+        this.canShare = false
+        this.policies = []
         setToken('')
         const cur = router.currentRoute.value
         if (cur.path === '/login') return // 登录页自身的 401 不再跳，防循环
@@ -65,20 +69,26 @@ export const useAuthStore = defineStore('auth', {
       const me = await api.getMe()
       this.user = me.user
       this.role = me.role
+      this.canShare = me.role === 'admin' || !!me.can_share
+      this.policies = me.policies || []
     },
     async login(username: string, password: string) {
       const r = await api.login(username, password)
-      this.afterAuth(r)
+      await this.afterAuth(r)
     },
     async bootstrap(username: string, password: string) {
       const r = await api.bootstrap(username, password)
       this.needsBootstrap = false
-      this.afterAuth(r)
+      await this.afterAuth(r)
     },
-    afterAuth(r: { user: string; role: string }) {
+    async afterAuth(r: { user: string; role: string }) {
       this.token = getToken() // client 已从 X-Auth-Token 捕获
       this.user = r.user
       this.role = r.role as Role
+      this.canShare = r.role === 'admin'
+      try {
+        await this.refreshMe()
+      } catch { /* 忽略 */ }
       const target = this.redirect || '/'
       this.redirect = ''
       router.replace(target)
@@ -87,6 +97,7 @@ export const useAuthStore = defineStore('auth', {
       try { await api.logout() } catch { /* 忽略 */ }
       setToken('')
       this.token = ''; this.user = ''; this.role = ''
+      this.canShare = false; this.policies = []
       this.redirect = ''
       router.replace('/login')
     },

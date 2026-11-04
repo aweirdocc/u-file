@@ -5,6 +5,8 @@ import (
 	"strconv"
 
 	"github.com/gin-gonic/gin"
+
+	"ufile/internal/auth"
 )
 
 // search 文件名搜索（基于索引缓存/快照）。
@@ -16,14 +18,26 @@ func (s *Server) search(c *gin.Context) {
 		return
 	}
 	limit, _ := strconv.Atoi(c.Query("limit"))
-	hits := s.index.Search(q, c.Query("source"), limit)
+	if limit <= 0 {
+		limit = 50
+	}
+	// 若指定了单源过滤，先校验是否有该源读权限
+	srcFilter := c.Query("source")
+	if srcFilter != "" && !s.checkSourceAccess(c, srcFilter, auth.ActionRead) {
+		return
+	}
+	hits := s.index.Search(q, srcFilter, limit*5)
 	// 附加源显示名
 	names := map[string]string{}
 	for _, src := range s.sources.List() {
 		names[src.ID] = src.Name
 	}
+	user := s.currentUsername(c)
 	out := make([]gin.H, 0, len(hits))
 	for _, h := range hits {
+		if s.auth != nil && !s.auth.CanAccess(user, h.SourceID, h.Path, auth.ActionRead) {
+			continue
+		}
 		out = append(out, gin.H{
 			"source_id":   h.SourceID,
 			"source_name": names[h.SourceID],
@@ -33,6 +47,9 @@ func (s *Server) search(c *gin.Context) {
 			"size":        h.Size,
 			"mod_time":    h.ModTime,
 		})
+		if len(out) >= limit {
+			break
+		}
 	}
 	c.JSON(http.StatusOK, gin.H{"query": q, "count": len(out), "hits": out})
 }

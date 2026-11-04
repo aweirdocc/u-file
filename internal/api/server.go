@@ -22,6 +22,7 @@ import (
 	"ufile/internal/index"
 	"ufile/internal/share"
 	"ufile/internal/source"
+	"ufile/internal/thumb"
 )
 
 // textLikeExtensions 视为文本预览的扩展名（前端按此判断，后端兜底嗅探）。
@@ -45,6 +46,8 @@ func previewKind(name string) string {
 		return "audio"
 	case ".pdf":
 		return "pdf"
+	case ".docx", ".xlsx", ".pptx":
+		return "office"
 	case ".md", ".markdown":
 		return "markdown"
 	}
@@ -83,17 +86,18 @@ type Server struct {
 	sources   *source.Manager
 	auth      *auth.Store
 	audit     *audit.Log
-	index     *index.Cache // 可为 nil（未启用索引缓存）
+	index     *index.Cache   // 可为 nil（未启用索引缓存）
 	shares    *share.Manager // 可为 nil（未启用分享外链）
-	webFS     fs.FS        // 前端静态资源（Vue 构建产物）
-	indexHTML []byte       // 入口 index.html（启动时读入）
+	thumbs    *thumb.Cache   // 内存缩略图缓存
+	webFS     fs.FS          // 前端静态资源（Vue 构建产物）
+	indexHTML []byte         // 入口 index.html（启动时读入）
 }
 
 // New 构造 API 服务。authStore/auditLog 可为 nil（无鉴权模式）；
 // indexCache/sharesMgr 可为 nil（未启用索引缓存/分享外链）；webFS 为前端静态资源（必传）。
 func New(cfgSources *source.Manager, authStore *auth.Store, auditLog *audit.Log, indexCache *index.Cache, sharesMgr *share.Manager, webFS fs.FS) (*Server, error) {
 	gin.SetMode(gin.ReleaseMode)
-	s := &Server{engine: gin.New(), sources: cfgSources, auth: authStore, audit: auditLog, index: indexCache, shares: sharesMgr, webFS: webFS}
+	s := &Server{engine: gin.New(), sources: cfgSources, auth: authStore, audit: auditLog, index: indexCache, shares: sharesMgr, thumbs: thumb.NewCache(512), webFS: webFS}
 	s.engine.Use(gin.Logger(), gin.Recovery())
 
 	s.engine.GET("/healthz", func(c *gin.Context) {
@@ -102,23 +106,26 @@ func New(cfgSources *source.Manager, authStore *auth.Store, auditLog *audit.Log,
 
 	grp := s.engine.Group("/api/v1")
 
-	// —— 鉴权（无鉴权模式下不注册）——
+	authAdmin := s.requireRole(auth.RoleAdmin)
+	authAny := s.requireRole(auth.RoleAdmin, auth.RoleUser, auth.RoleGuest)
+
+	// —— 鉴权与用户管理（无鉴权模式下不注册）——
 	if s.auth != nil {
 		grp.POST("/auth/bootstrap", s.bootstrap) // 仅无用户时可创建首个管理员
 		grp.POST("/auth/login", s.login)
 		grp.GET("/auth/pubkey", s.loginPubKey) // 登录密码信封加密公钥（无需登录）
-		grp.GET("/auth/status", s.authStatus) // 前端判断是否需要引导/登录
-		grp.GET("/auth/me", s.requireRole(auth.RoleAdmin, auth.RoleGuest), s.me)
-		grp.POST("/auth/users", s.requireRole(auth.RoleAdmin), s.createUser)
-		grp.GET("/auth/users", s.requireRole(auth.RoleAdmin), s.listUsers)
-		grp.DELETE("/auth/users/:name", s.requireRole(auth.RoleAdmin), s.deleteUser)
-		grp.POST("/auth/users/:name/password", s.requireRole(auth.RoleAdmin), s.resetPassword)
-		grp.POST("/auth/logout", s.requireRole(auth.RoleAdmin, auth.RoleGuest), s.logout)
+		grp.GET("/auth/status", s.authStatus)  // 前端判断是否需要引导/登录
+		grp.GET("/auth/me", authAny, s.me)
+		grp.POST("/auth/users", authAdmin, s.createUser)
+		grp.GET("/auth/users", authAdmin, s.listUsers)
+		grp.PUT("/auth/users/:name", authAdmin, s.updateUser)
+		grp.PUT("/auth/users/:name/policies", authAdmin, s.updateUserPolicies)
+		grp.DELETE("/auth/users/:name", authAdmin, s.deleteUser)
+		grp.POST("/auth/users/:name/password", authAdmin, s.resetPassword)
+		grp.POST("/auth/logout", authAny, s.logout)
 	}
 
-	// —— 源管理（admin 专用；guest 只读浏览）——
-	authAdmin := s.requireRole(auth.RoleAdmin)
-	authAny := s.requireRole(auth.RoleAdmin, auth.RoleGuest)
+	// —— 源管理（admin 专用写；有 read 权限的用户可见授权源）——
 	grp.GET("/sources", authAny, s.listSources)
 	grp.GET("/sources/:id", authAny, s.getSource)
 	grp.GET("/sources/export", authAdmin, s.exportSources) // 全量导出含明文凭据，admin only
@@ -128,20 +135,22 @@ func New(cfgSources *source.Manager, authStore *auth.Store, auditLog *audit.Log,
 	grp.PUT("/sources/:id", authAdmin, s.updateSource)
 	grp.DELETE("/sources/:id", authAdmin, s.removeSource)
 
-	// —— 浏览/下载/预览（guest 可用）——
+	// —— 浏览/下载/预览（按 ACL read 权限校验）——
 	grp.GET("/sources/:id/files", authAny, s.listFiles)
 	grp.GET("/sources/:id/download", authAny, s.download)
 	grp.GET("/sources/:id/raw", authAny, s.raw)
+	grp.GET("/sources/:id/thumb", authAny, s.thumb)
+	grp.GET("/sources/:id/office", authAny, s.officePreview)
 	grp.GET("/sources/:id/presign", authAny, s.presign)
 	grp.GET("/sources/:id/archive", authAny, s.archive) // 多选/整目录 zip 流式打包
 
-	// —— 写操作（admin；驱动需实现 Writer 能力）——
-	grp.POST("/sources/:id/upload", authAdmin, s.upload)
-	grp.POST("/sources/:id/mkdir", authAdmin, s.mkdir)
-	grp.POST("/sources/:id/delete", authAdmin, s.deleteEntries)
-	grp.POST("/sources/:id/rename", authAdmin, s.renameEntry)
+	// —— 写与删除操作（按 ACL write / delete 权限校验；驱动需实现 Writer 能力）——
+	grp.POST("/sources/:id/upload", authAny, s.upload)
+	grp.POST("/sources/:id/mkdir", authAny, s.mkdir)
+	grp.POST("/sources/:id/delete", authAny, s.deleteEntries)
+	grp.POST("/sources/:id/rename", authAny, s.renameEntry)
 
-	// —— 搜索（基于索引快照；index 未启用时不注册）——
+	// —— 搜索（基于索引快照；按 ACL 过滤可见命中结果）——
 	if s.index != nil {
 		grp.GET("/search", authAny, s.search)
 	}
@@ -153,16 +162,18 @@ func New(cfgSources *source.Manager, authStore *auth.Store, auditLog *audit.Log,
 		grp.GET("/index/status", authAny, s.indexStatus)
 	}
 
-	// —— 分享外链（M3）：管理面 admin；公开面无登录（校验在 handler 内）——
+	// —— 分享外链（M3）：管理面按 ACL share / admin 校验；公开面无登录 ——
 	if s.shares != nil {
-		grp.POST("/shares", authAdmin, s.createShare)
-		grp.GET("/shares", authAdmin, s.listShares)
-		grp.DELETE("/shares/:id", authAdmin, s.deleteShare)
+		grp.POST("/shares", authAny, s.createShare)
+		grp.GET("/shares", authAny, s.listShares)
+		grp.DELETE("/shares/:id", authAny, s.deleteShare)
 
 		grp.GET("/s/:token", s.shareInfo)
 		grp.POST("/s/:token/access", s.shareAccess)
 		grp.GET("/s/:token/download", s.shareDownload)
 		grp.GET("/s/:token/raw", s.shareRaw)
+		grp.GET("/s/:token/thumb", s.shareThumb)
+		grp.GET("/s/:token/office", s.shareOffice)
 	}
 
 	// —— 前端静态资源（Vue 构建产物，web/embed.go 内嵌 dist/）——
@@ -367,48 +378,6 @@ func (s *Server) authStatus(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"auth_enabled": s.auth != nil, "needs_bootstrap": s.auth != nil && !s.auth.HasUsers()})
 }
 
-func (s *Server) me(c *gin.Context) {
-	user, _ := c.Get("user")
-	role, _ := c.Get("role")
-	c.JSON(http.StatusOK, gin.H{"user": user, "role": role})
-}
-
-func (s *Server) createUser(c *gin.Context) {
-	var req struct {
-		Username string    `json:"username"`
-		Password string    `json:"password"`
-		Role     auth.Role `json:"role"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"code": "INVALID_PARAM", "message": err.Error()})
-		return
-	}
-	if req.Role == "" {
-		req.Role = auth.RoleGuest
-	}
-	if err := s.auth.Create(req.Username, req.Password, req.Role); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"code": "INVALID_PARAM", "message": err.Error()})
-		return
-	}
-	s.auditAction(c, "auth.user.create", gin.H{"target": req.Username, "role": req.Role})
-	c.JSON(http.StatusCreated, gin.H{"user": req.Username, "role": req.Role})
-}
-
-type viewUser struct {
-	Name      string    `json:"username"`
-	Role      auth.Role `json:"role"`
-	CreatedAt time.Time `json:"created_at"`
-}
-
-func (s *Server) listUsers(c *gin.Context) {
-	users := s.auth.List()
-	out := make([]viewUser, 0, len(users))
-	for _, u := range users {
-		out = append(out, viewUser{Name: u.Name, Role: u.Role, CreatedAt: u.CreatedAt})
-	}
-	c.JSON(http.StatusOK, out)
-}
-
 func (s *Server) deleteUser(c *gin.Context) {
 	name := c.Param("name")
 	if me, _ := c.Get("user"); me == name {
@@ -460,7 +429,26 @@ func (s *Server) resolveSource(c *gin.Context) (*source.Source, bool) {
 // —— 源管理 ——
 
 func (s *Server) listSources(c *gin.Context) {
-	c.JSON(http.StatusOK, s.sources.List())
+	all := s.sources.List()
+	if s.auth == nil {
+		c.JSON(http.StatusOK, all)
+		return
+	}
+	user := s.currentUsername(c)
+	admin := s.isAdmin(c)
+	out := make([]sourceView, 0, len(all))
+	for _, src := range all {
+		acc := s.auth.SourceAccessOf(user, src.ID)
+		if acc == nil {
+			continue
+		}
+		cp := *src
+		if !admin {
+			cp.Config = nil
+		}
+		out = append(out, sourceView{Source: &cp, Access: acc})
+	}
+	c.JSON(http.StatusOK, out)
 }
 
 func (s *Server) getSource(c *gin.Context) {
@@ -468,14 +456,19 @@ func (s *Server) getSource(c *gin.Context) {
 	if !ok {
 		return
 	}
+	if !s.checkSourceAccess(c, src.ID, auth.ActionRead) {
+		return
+	}
 	out := src.Sanitized()
-	// 仅管理员（或无鉴权开发模式）返回脱敏后的 config 供编辑弹窗回显；guest 隐藏配置详情
+	var acc *auth.SourceAccess
+	// 仅管理员（或无鉴权开发模式）返回脱敏后的 config 供编辑弹窗回显；非 admin 隐藏配置详情
 	if s.auth != nil {
-		if role, _ := c.Get("role"); role != auth.RoleAdmin {
+		if !s.isAdmin(c) {
 			out.Config = nil
 		}
+		acc = s.auth.SourceAccessOf(s.currentUsername(c), src.ID)
 	}
-	c.JSON(http.StatusOK, out)
+	c.JSON(http.StatusOK, sourceView{Source: out, Access: acc})
 }
 
 // addSource 新增文件源。请求体：
@@ -613,18 +606,28 @@ func (s *Server) listFiles(c *gin.Context) {
 	if !ok {
 		return
 	}
+	p := c.Query("path")
+	var entryFilter func(entryPath string, isDir bool) bool
+	if s.auth != nil && !s.auth.CanAccess(s.currentUsername(c), src.ID, p, auth.ActionRead) {
+		isAnc, flt := s.auth.IsAncestorOfAllowed(s.currentUsername(c), src.ID, p)
+		if !isAnc {
+			s.checkPathAccess(c, src.ID, p, auth.ActionRead)
+			return
+		}
+		entryFilter = flt
+	}
 	limit, _ := strconv.Atoi(c.Query("limit"))
 	refresh := c.Query("refresh") == "1" // 手动刷新绕过索引缓存
 	var res *driver.ListResult
 	var err error
 	if s.index != nil {
 		s.index.Touch(src.ID)
-		res, err = s.index.List(c.Request.Context(), src.ID, src.Driver(), c.Query("path"), driver.ListOptions{
+		res, err = s.index.List(c.Request.Context(), src.ID, src.Driver(), p, driver.ListOptions{
 			Cursor: c.Query("cursor"),
 			Limit:  limit,
 		}, refresh)
 	} else {
-		res, err = src.Driver().List(c.Request.Context(), c.Query("path"), driver.ListOptions{
+		res, err = src.Driver().List(c.Request.Context(), p, driver.ListOptions{
 			Cursor: c.Query("cursor"),
 			Limit:  limit,
 		})
@@ -633,12 +636,27 @@ func (s *Server) listFiles(c *gin.Context) {
 		s.fail(c, err)
 		return
 	}
+	if entryFilter != nil && res != nil {
+		filtered := make([]driver.Entry, 0, len(res.Entries))
+		for _, e := range res.Entries {
+			if entryFilter(e.Path, e.IsDir) {
+				filtered = append(filtered, e)
+			}
+		}
+		res = &driver.ListResult{
+			Entries:    filtered,
+			NextCursor: res.NextCursor,
+		}
+	}
 	c.JSON(http.StatusOK, res)
 }
 
 // syncStatus 单源同步状态。
 func (s *Server) syncStatus(c *gin.Context) {
 	if _, ok := s.resolveSource(c); !ok {
+		return
+	}
+	if !s.checkSourceAccess(c, c.Param("id"), auth.ActionRead) {
 		return
 	}
 	c.JSON(http.StatusOK, s.index.StatusOf(c.Param("id")))
@@ -655,9 +673,21 @@ func (s *Server) syncTrigger(c *gin.Context) {
 	c.JSON(http.StatusAccepted, gin.H{"ok": true, "message": "同步已开始"})
 }
 
-// indexStatus 全部源同步状态。
+// indexStatus 全部有权限源的同步状态。
 func (s *Server) indexStatus(c *gin.Context) {
-	c.JSON(http.StatusOK, s.index.AllStatus())
+	all := s.index.AllStatus()
+	if s.auth == nil || s.isAdmin(c) {
+		c.JSON(http.StatusOK, all)
+		return
+	}
+	user := s.currentUsername(c)
+	filtered := make([]index.Status, 0, len(all))
+	for _, st := range all {
+		if s.auth.CanAccessSource(user, st.SourceID, auth.ActionRead) {
+			filtered = append(filtered, st)
+		}
+	}
+	c.JSON(http.StatusOK, filtered)
 }
 
 // serveInline /raw 与 /download 共用的流式输出：disposition 决定 inline 还是 attachment。
@@ -700,6 +730,9 @@ func (s *Server) download(c *gin.Context) {
 	path := c.Query("path")
 	if path == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"code": "INVALID_PARAM", "message": "缺少 path 参数"})
+		return
+	}
+	if !s.checkPathAccess(c, src.ID, path, auth.ActionRead) {
 		return
 	}
 
@@ -747,6 +780,9 @@ func (s *Server) raw(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"code": "INVALID_PARAM", "message": "缺少 path 参数"})
 		return
 	}
+	if !s.checkPathAccess(c, src.ID, path, auth.ActionRead) {
+		return
+	}
 	if previewKind(path) == "" {
 		c.JSON(http.StatusUnsupportedMediaType, gin.H{"code": "NOT_PREVIEWABLE", "message": "该文件类型不支持预览"})
 		return
@@ -767,6 +803,9 @@ func (s *Server) presign(c *gin.Context) {
 	path := c.Query("path")
 	if path == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"code": "INVALID_PARAM", "message": "缺少 path 参数"})
+		return
+	}
+	if !s.checkPathAccess(c, src.ID, path, auth.ActionRead) {
 		return
 	}
 	ttl := 15 * time.Minute

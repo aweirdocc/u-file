@@ -10,10 +10,7 @@ const browse = useBrowseStore()
 <template>
   <div class="crumb-bar">
     <el-breadcrumb separator="/">
-      <el-breadcrumb-item>
-        <a class="crumb-link" @click.prevent="emit('navigate', browse.source, '')">{{ browse.source }}</a>
-      </el-breadcrumb-item>
-      <el-breadcrumb-item v-for="c in browse.breadcrumbs.slice(1)" :key="c.path">
+      <el-breadcrumb-item v-for="c in browse.breadcrumbs" :key="c.path">
         <a class="crumb-link" @click.prevent="emit('navigate', browse.source, c.path)">{{ c.name }}</a>
       </el-breadcrumb-item>
     </el-breadcrumb>

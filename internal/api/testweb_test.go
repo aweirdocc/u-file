@@ -2,10 +2,17 @@ package api
 
 import (
 	"io/fs"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
 )
+
+func get(t *testing.T, h http.Handler, url string) *httptest.ResponseRecorder {
+	t.Helper()
+	return getAuth(t, h, url, "")
+}
 
 // testWebFS 构造一个最小前端资源（index.html），供 API 单测使用。
 func testWebFS(t *testing.T) fs.FS {
