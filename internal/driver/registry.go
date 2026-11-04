@@ -75,6 +75,20 @@ func CleanPath(p string) (string, error) {
 
 // —— 源配置取值辅助（yaml.v3 解出的数值为 int，JSON 为 float64，需统一兼容）——
 
+// RefreshTokenSaverKey 是注入到 cfg 中的内部回调键名：
+// 当驱动（如阿里云盘 OAuth2）刷新出新的 refresh_token 时，可调用该回调持久化回写。
+const RefreshTokenSaverKey = "_on_refresh_token"
+
+// NotifyRefreshToken 若 cfg 中注入了持久化回调，则通知上层保存新 refresh_token。
+func NotifyRefreshToken(cfg map[string]any, newRefreshToken string) {
+	if cfg == nil || newRefreshToken == "" {
+		return
+	}
+	if fn, ok := cfg[RefreshTokenSaverKey].(func(string)); ok && fn != nil {
+		fn(newRefreshToken)
+	}
+}
+
 func Str(cfg map[string]any, key, def string) string {
 	if v, ok := cfg[key].(string); ok && v != "" {
 		return v

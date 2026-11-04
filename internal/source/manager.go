@@ -64,7 +64,9 @@ func (s *Source) Sanitized() *Source {
 
 func isSecretKey(k string) bool {
 	switch k {
-	case "access_key", "secret_key", "password":
+	case "access_key", "secret_key", "password",
+		"private_key", "private_key_passphrase",
+		"refresh_token", "client_secret", "service_account_json":
 		return true
 	}
 	return false
@@ -79,11 +81,12 @@ type TestResult struct {
 
 // Manager 持有全部源，串行化变更。
 type Manager struct {
-	mu     sync.RWMutex
-	cipher *crypt.Cipher // nil 表示未启用加密（单测场景），落库降级为明文
-	sources map[string]*Source
-	order   []string
-	file    string // data/sources.json
+	mu            sync.RWMutex
+	cipher        *crypt.Cipher // nil 表示未启用加密（单测场景），落库降级为明文
+	sources       map[string]*Source
+	order         []string
+	file          string            // data/sources.json
+	rotatedTokens map[string]string // oldRefreshToken -> newRefreshToken（承接「先测试后保存」期间滚动刷新的令牌）
 
 	// OnRemove 源删除后的回调（可选；索引缓存联动清理等）。
 	// 在锁外调用，签名 params 为被删源 ID。
@@ -97,9 +100,10 @@ func NewManager(dataDir string, seed []Seed, cipher *crypt.Cipher) (*Manager, er
 		return nil, err
 	}
 	m := &Manager{
-		sources: map[string]*Source{},
-		file:    filepath.Join(dataDir, "sources.json"),
-		cipher:  cipher,
+		sources:       map[string]*Source{},
+		file:          filepath.Join(dataDir, "sources.json"),
+		cipher:        cipher,
+		rotatedTokens: map[string]string{},
 	}
 	if err := m.load(); err != nil {
 		return nil, err
@@ -144,8 +148,15 @@ func (m *Manager) Get(id string) (*Source, error) {
 	if !ok {
 		return nil, ErrNotFound
 	}
-	// 内部使用（下载/列取）：返回含 config 的原对象，调用方不得外传
+	// 内部使用（下载/列取）：深拷贝 Config map，防止与后台 refresh_token 并发更新产生竞态
 	cp := *s
+	if s.Config != nil {
+		cfgCopy := make(map[string]any, len(s.Config))
+		for k, v := range s.Config {
+			cfgCopy[k] = v
+		}
+		cp.Config = cfgCopy
+	}
 	return &cp, nil
 }
 
@@ -155,8 +166,9 @@ func (m *Manager) Add(id, name, typ string, cfg map[string]any) (*Source, error)
 	if !idPattern.MatchString(id) {
 		return nil, fmt.Errorf("%w：id 只允许字母数字与 - _，1~64 字符", ErrBadID)
 	}
+	cfg = m.applyRotatedToken(cfg)
 	// 未知类型 / 配置不完整，立刻暴露
-	drv, err := driver.New(typ, cfg)
+	drv, err := driver.New(typ, m.withCallbacks(id, cfg))
 	if err != nil {
 		return nil, err
 	}
@@ -196,7 +208,7 @@ func (m *Manager) Update(id, name string, cfg map[string]any, keepSecret bool) (
 		merged := make(map[string]any, len(cfg))
 		for k, v := range cfg {
 			if isSecretKey(k) && v == redactedMark {
-				if ov, ok := old.Config[k]; ok && v != "" {
+				if ov, ok := old.Config[k]; ok && ov != "" {
 					merged[k] = ov
 					continue
 				}
@@ -205,7 +217,8 @@ func (m *Manager) Update(id, name string, cfg map[string]any, keepSecret bool) (
 		}
 		cfg = merged
 	}
-	drv, err := driver.New(old.Type, cfg)
+	cfg = m.applyRotatedTokenLocked(cfg)
+	drv, err := driver.New(old.Type, m.withCallbacks(id, cfg))
 	if err != nil {
 		return nil, err
 	}
@@ -269,8 +282,66 @@ func (m *Manager) IDs() []string {
 // Test 用给定参数建立驱动并列取根目录，返回耗时与错误摘要。
 // 不落盘 —— “先测后存”由前端组合完成。
 func (m *Manager) Test(ctx context.Context, typ string, cfg map[string]any) *TestResult {
+	return m.TestWithExisting(ctx, "", typ, cfg)
+}
+
+// TestWithExisting 支持在编辑已有源（existingID 非空）时，将 cfg 中的打码凭据 "******"
+// 自动替换为已保存源的真实凭据后再测试连接；若测试期间触发了 OAuth2 refresh_token 轮转，
+// 自动记录轮转映射并（当复用已有源 token 时）同步更新存量源配置。
+func (m *Manager) TestWithExisting(ctx context.Context, existingID, typ string, cfg map[string]any) *TestResult {
+	usedExistingRefresh := false
+	if existingID != "" && cfg != nil {
+		m.mu.RLock()
+		old, ok := m.sources[existingID]
+		if ok {
+			merged := make(map[string]any, len(cfg))
+			for k, v := range cfg {
+				if isSecretKey(k) && v == redactedMark {
+					if ov, ok := old.Config[k]; ok && ov != "" {
+						merged[k] = ov
+						if k == "refresh_token" {
+							usedExistingRefresh = true
+						}
+						continue
+					}
+				}
+				merged[k] = v
+			}
+			cfg = merged
+		}
+		m.mu.RUnlock()
+	}
+	cfg = m.applyRotatedToken(cfg)
+	origRefresh, _ := cfg["refresh_token"].(string)
+
+	testCfg := make(map[string]any, len(cfg)+1)
+	for k, v := range cfg {
+		testCfg[k] = v
+	}
+	testCfg[driver.RefreshTokenSaverKey] = func(newToken string) {
+		if newToken == "" {
+			return
+		}
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		if origRefresh != "" && origRefresh != newToken {
+			m.rotatedTokens[origRefresh] = newToken
+		}
+		if usedExistingRefresh && existingID != "" {
+			if s, ok := m.sources[existingID]; ok && s.Config != nil {
+				newCfg := make(map[string]any, len(s.Config))
+				for k, v := range s.Config {
+					newCfg[k] = v
+				}
+				newCfg["refresh_token"] = newToken
+				s.Config = newCfg
+				_ = m.saveLocked()
+			}
+		}
+	}
+
 	start := time.Now()
-	drv, err := driver.New(typ, cfg)
+	drv, err := driver.New(typ, testCfg)
 	if err != nil {
 		return &TestResult{OK: false, Latency: ms(start), Error: err.Error()}
 	}
@@ -281,6 +352,77 @@ func (m *Manager) Test(ctx context.Context, typ string, cfg map[string]any) *Tes
 }
 
 func ms(start time.Time) int64 { return time.Since(start).Milliseconds() }
+
+func (m *Manager) applyRotatedToken(cfg map[string]any) map[string]any {
+	if cfg == nil {
+		return nil
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.applyRotatedTokenLocked(cfg)
+}
+
+func (m *Manager) applyRotatedTokenLocked(cfg map[string]any) map[string]any {
+	if cfg == nil || len(m.rotatedTokens) == 0 {
+		return cfg
+	}
+	rt, ok := cfg["refresh_token"].(string)
+	if !ok || rt == "" {
+		return cfg
+	}
+	// 沿着轮转链找到最新的 refresh_token（最多跳 8 次防环）
+	cur := rt
+	for range 8 {
+		next, exists := m.rotatedTokens[cur]
+		if !exists || next == "" || next == cur {
+			break
+		}
+		cur = next
+	}
+	if cur == rt {
+		return cfg
+	}
+	out := make(map[string]any, len(cfg))
+	for k, v := range cfg {
+		out[k] = v
+	}
+	out["refresh_token"] = cur
+	return out
+}
+
+// withCallbacks 返回带运行时回调（如 OAuth2 refresh_token 滚动回写）的浅拷贝 cfg，
+// 不污染存盘的原始 Config map。
+func (m *Manager) withCallbacks(id string, cfg map[string]any) map[string]any {
+	out := make(map[string]any, len(cfg)+1)
+	for k, v := range cfg {
+		out[k] = v
+	}
+	out[driver.RefreshTokenSaverKey] = func(newToken string) {
+		if newToken == "" {
+			return
+		}
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		s, ok := m.sources[id]
+		if !ok || s.Config == nil {
+			return
+		}
+		if cur, _ := s.Config["refresh_token"].(string); cur == newToken {
+			return
+		} else if cur != "" {
+			m.rotatedTokens[cur] = newToken
+		}
+		// Copy-on-write 替换 s.Config，避免与锁外持有旧 map 引用的读操作并发冲突
+		newCfg := make(map[string]any, len(s.Config))
+		for k, v := range s.Config {
+			newCfg[k] = v
+		}
+		newCfg["refresh_token"] = newToken
+		s.Config = newCfg
+		_ = m.saveLocked()
+	}
+	return out
+}
 
 // —— 持久化 ——
 
@@ -315,7 +457,7 @@ func (m *Manager) load() error {
 		if encryptedCount(s.Config) < secretCount(dec) {
 			dirty = true // 磁盘上还有明文凭据 → 触发一次加密重写
 		}
-		drv, err := driver.New(s.Type, dec)
+		drv, err := driver.New(s.Type, m.withCallbacks(s.ID, dec))
 		if err != nil {
 			// 单个源损坏（如驱动被移除、配置缺失）不阻断整体启动，标记待修
 			fmt.Fprintf(os.Stderr, "[warn] source %q 加载失败，已跳过: %v\n", s.ID, err)

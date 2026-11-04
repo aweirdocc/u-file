@@ -468,8 +468,13 @@ func (s *Server) getSource(c *gin.Context) {
 	if !ok {
 		return
 	}
-	out := *src
-	out.Config = nil // 详情页不回显配置（含打码值），M1 的编辑功能再定策略
+	out := src.Sanitized()
+	// 仅管理员（或无鉴权开发模式）返回脱敏后的 config 供编辑弹窗回显；guest 隐藏配置详情
+	if s.auth != nil {
+		if role, _ := c.Get("role"); role != auth.RoleAdmin {
+			out.Config = nil
+		}
+	}
 	c.JSON(http.StatusOK, out)
 }
 
@@ -714,9 +719,11 @@ func (s *Server) download(c *gin.Context) {
 	s.serveInline(c, src, path, "attachment")
 }
 
-// testSource 连接测试（不落盘）。请求体与 addSource 相同（id 可省略）。
+// testSource 连接测试（不落盘）。请求体与 addSource 相同（id 可选：编辑已有源时传入 id，
+// 若凭据字段为打码值 "******" 则自动合并数据库中的旧凭据）。
 func (s *Server) testSource(c *gin.Context) {
 	var req struct {
+		ID     string         `json:"id"`
 		Type   string         `json:"type"`
 		Config map[string]any `json:"config"`
 	}
@@ -726,7 +733,7 @@ func (s *Server) testSource(c *gin.Context) {
 	}
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
 	defer cancel()
-	c.JSON(http.StatusOK, s.sources.Test(ctx, req.Type, req.Config))
+	c.JSON(http.StatusOK, s.sources.TestWithExisting(ctx, req.ID, req.Type, req.Config))
 }
 
 // raw 内联预览输出：仅允许白名单内的可预览类型，杜绝任意 HTML/SVG 直出钓鱼。

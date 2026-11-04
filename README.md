@@ -1,8 +1,12 @@
 # u-file
 
-> **U**nified **File** —— 可私有化部署的统一文件管理服务平台：把对象存储（S3 / 阿里云 OSS / 腾讯云 COS / 华为云 OBS / 七牛 Kodo / 百度 BOS / Cloudflare R2 / MinIO）、FTP、SFTP、数据库（BLOB / GridFS）、本地磁盘等异构文件源统一接入，提供 Web 文件浏览、搜索、下载与基础管理能力。
+> **U**nified **File** —— 可私有化部署的统一文件管理服务平台：把对象存储（S3 / 阿里云 OSS / 腾讯云 COS / 华为云 OBS / 七牛 Kodo / 百度 BOS / Cloudflare R2 / MinIO）、WebDAV（坚果云 / Nextcloud / NAS）、云盘（Google Drive / 阿里云盘）、FTP、SFTP、数据库（BLOB / GridFS）、本地磁盘等异构文件源统一接入，提供 Web 文件浏览、搜索、预览、分享外链、下载与基础管理能力。
 
-**当前状态：M2 已完成**（写能力：上传/删除/重命名/建目录 + zip 打包下载 + 索引搜索 + FTP/FTPS/SFTP 驱动；M1：凭据加密落库 + 登录鉴权/角色/审计 + 索引缓存与后台同步；M0：驱动抽象 + local/s3 驱动 + 流式下载网关）。规划文档见 [docs/](./docs/)。
+**当前状态：M3 进行中（分享外链 + 云盘/WebDAV 驱动 + 主题与安全升级已完成）**
+- **M3（已落地部分）**：分享外链（有效期/提取码/下载次数限制、公开提取页 `/s/:token`）+ `webdav`（坚果云/NAS）、`gdrive`（Google Drive）、`alipan`（阿里云盘 OpenAPI）三大驱动 + 独立登录页/RSA-OAEP 密码信封加密 + 亮/暗模式与 5 种主题色切换；
+- **M2（已完成）**：写能力（上传/删除/重命名/建目录）+ zip 流式打包下载 + 索引搜索 + FTP/FTPS/SFTP 驱动 + Vue 3 前端工程化重构；
+- **M1（已完成）**：凭据 AES-256-GCM 加密落库 + 登录鉴权/角色/审计 + 索引缓存与后台同步 + 文件在线预览；
+- **M0（已完成）**：统一驱动抽象 `FSDriver` + `local`/`s3` 驱动 + 流式下载网关。规划文档见 [docs/](./docs/)。
 
 ## 文档导航
 
@@ -12,6 +16,7 @@
 | [docs/02-需求与产品规划.md](./docs/02-需求与产品规划.md) | 产品定位、目标用户、功能范围（P0~P3）、里程碑、验收标准 |
 | [docs/03-技术可行性分析.md](./docs/03-技术可行性分析.md) | 技术栈选型、各类文件源逐项可行性、风险与缓解、结论 |
 | [docs/04-总体架构设计.md](./docs/04-总体架构设计.md) | 分层架构、驱动接口设计、数据模型、API 草案、安全与部署 |
+| [docs/05-云盘与WebDAV驱动设计.md](./docs/05-云盘与WebDAV驱动设计.md) | WebDAV（坚果云/NAS）、Google Drive、阿里云盘驱动架构与协议设计 |
 | [docs/research/01-技术调研笔记.md](./docs/research/01-技术调研笔记.md) | 调研原始笔记（一手来源、带引用链接） |
 | [docs/m0-poc-验证记录.md](./docs/m0-poc-验证记录.md) | M0 PoC 冒烟与大文件内存验证记录 |
 
@@ -55,6 +60,9 @@ go test ./...
 |---|---|---|
 | `local` | `root: 本地目录` | 列表 / 下载 / Range / 上传·删除·重命名·建目录 |
 | `s3` | `endpoint` `region` `bucket` `access_key` `secret_key` `use_path_style` `prefix`(可选) | 列表(游标分页) / 下载 / Range / 预签名直链 / 写能力(需凭据) |
+| `webdav` | `endpoint`(如坚果云 `https://dav.jianguoyun.com/dav/我的坚果云`) `username` `password` `root`(可选) `insecure_tls` `proxy_url` | 列表 / 下载(Range) / 写能力 |
+| `gdrive` | `auth_type`(`oauth2` 或 `service_account`) `client_id` `client_secret` `refresh_token` / `service_account_json` `root_folder_id` `drive_id` `proxy_url` | 列表(游标分页) / 下载(Range) / 写能力(删除移入回收站) |
+| `alipan` | `drive_type`(`backup` 或 `resource`) `refresh_token` + (`client_id` & `client_secret` 或 `oauth_token_url`) `root_folder_id` | 列表(游标分页) / 下载(Range) / 预签名直链 / 写能力(分片上传，删除移入回收站) |
 | `ftp` | `host` `port`(默认21) `username` `password` `tls`(FTPS) `insecure_tls` `root`(可选) | 列表 / 下载(断点) / 写能力 |
 | `sftp` | `host` `port`(默认22) `username` + `password` 或 `private_key`(PEM 内容或路径，`private_key_passphrase` 可选) `root`(可选) | 列表 / 下载(Seek) / 写能力 |
 
@@ -69,25 +77,32 @@ go test ./...
 | 方法 | 路径 | 权限 | 说明 |
 |---|---|---|---|
 | POST | `/api/v1/auth/bootstrap` | 无用户时 | 创建首个管理员（之后永久关闭） |
-| POST | `/api/v1/auth/login` | 公开 | 登录，返回 JWT（`X-Auth-Token` + Cookie）；连续失败 5 次起指数退避限速 |
+| POST | `/api/v1/auth/login` | 公开 | 登录，返回 JWT（`X-Auth-Token` + Cookie）；支持 `password_enc` 信封密文；连续失败 5 次起指数退避限速 |
+| GET | `/api/v1/auth/pubkey` | 公开 | 获取登录密码 RSA-OAEP-256 信封加密公钥（SPKI PEM） |
 | GET | `/api/v1/auth/status` | 公开 | `{auth_enabled, needs_bootstrap}` |
 | GET/POST/DELETE | `/api/v1/auth/users[...]` | admin | 访客账号管理（创建/列表/删除/重置密码） |
 | GET | `/api/v1/sources` | 登录 | 源列表（凭据打码为 `******`） |
+| GET | `/api/v1/sources/{id}` | 登录 | 获取单源详情（管理员回显打码后的 `config` 供编辑） |
 | POST | `/api/v1/sources` | admin | 新增：`{"id","name","type","config"}`，校验通过即时可用 |
 | PUT | `/api/v1/sources/{id}` | admin | 编辑：`{"name","config"}`；config 中凭据为 `******` 时保留旧凭据 |
 | DELETE | `/api/v1/sources/{id}` | admin | 删除 |
 | GET | `/api/v1/sources/export?redact=1` | admin | 导出全部源配置为 JSON 附件（`redact=1` 凭据打码，默认含明文凭据） |
 | POST | `/api/v1/sources/import` | admin | 导入源配置：`{"content": "<导出 JSON 或 JSON 字符串>", "overwrite": bool}`，逐条报告 added/updated/skipped/failed |
-| POST | `/api/v1/sources/test` | admin | 连接测试（不落盘）：`{"type","config"}` → `{"ok","latency_ms","error"}` |
+| POST | `/api/v1/sources/test` | admin | 连接测试（不落盘）：`{"id"(可选),"type","config"}` → `{"ok","latency_ms","error"}` |
 | GET | `/api/v1/sources/{id}/files?path=&cursor=&limit=&refresh=1` | 登录 | 目录列表（命中索引缓存；`refresh=1` 绕过缓存直读源） |
 | GET | `/api/v1/sources/{id}/sync` | 登录 | 该源索引同步状态（上次成功/失败原因/进行中） |
 | POST | `/api/v1/sources/{id}/sync` | admin | 立即触发该源同步 |
 | GET | `/api/v1/search?q=关键词&source=源ID(可选)&limit=50` | 登录 | 跨源文件名搜索（基于索引/快照，大小写不敏感包含匹配） |
 | POST | `/api/v1/sources/{id}/upload` | admin | multipart 上传（`file` 可多个 + `path` 目标目录），逐文件报告结果 |
 | POST | `/api/v1/sources/{id}/mkdir` | admin | 新建目录：`{"path": "a/b/c"}`（逐级创建） |
-| POST | `/api/v1/sources/{id}/delete` | admin | 批量删除：`{"paths": [...]}`（目录递归删） |
+| POST | `/api/v1/sources/{id}/delete` | admin | 批量删除：`{"paths": [...]}`（本地/S3/FTP/SFTP/WebDAV 递归删；Google Drive/阿里云盘移入回收站） |
 | POST | `/api/v1/sources/{id}/rename` | admin | 重命名/移动：`{"from", "to"}`（目录含内容整体移动） |
 | GET | `/api/v1/sources/{id}/archive?paths=a&paths=docs/&name=包名` | 登录 | 多选/整目录 zip 流式打包下载（不落盘；上限 1 万文件/2GB） |
+| GET/POST/DELETE | `/api/v1/shares[/:id]` | admin | 分享外链管理（创建/列表/撤销；支持有效期、提取码、下载次数上限） |
+| GET | `/api/v1/s/{token}` | 公开 | 查询公开分享元数据（文件/目录名、是否需要提取码、剩余次数） |
+| POST | `/api/v1/s/{token}/access` | 公开 | 校验分享提取码，成功后下发 1 小时免输码签名 Cookie（连续失败指数退避限速） |
+| GET | `/api/v1/s/{token}/download` | 公开 | 公开分享下载（单文件流式/Range，目录自动 zip 流式打包；超次或过期返回 410） |
+| GET | `/api/v1/s/{token}/raw` | 公开 | 公开分享在线预览（白名单类型，不扣减下载次数） |
 
 写操作仅对声明了 `write` 能力位的源开放（界面上自动显隐）。S3 匿名源（无凭据）为只读。
 
@@ -95,12 +110,31 @@ go test ./...
 
 **配置迁移**：页面右上角「导出配置 / 导入配置」可在实例间迁移源定义。导出可选脱敏（凭据替换为 `******`，适合分享/存档）；未脱敏导出含明文凭据，请勿入库或外发。导入兼容完整导出文件与裸数组两种格式，逐条校验并给出 added/updated/skipped/failed 报告；含脱敏凭据的条目导入后需补填真实凭据才能连接。
 
-## 鉴权与审计（M1）
+## 鉴权、密码信封加密与审计（M1/M3）
 
-- **角色**：`admin`（全权）与 `guest`（只读浏览/下载/预览）；首个账号通过 Web 引导创建（即管理员，之后引导入口永久关闭）
+- **角色**：`admin`（全权）与 `guest`（只读浏览/下载/预览）；首个账号通过独立登录页 `/login` 引导创建（即管理员，之后引导入口永久关闭）
 - **会话**：JWT（HS256，24h），前端走 `Authorization: Bearer`；浏览器预览/下载标签走 HttpOnly Cookie
+- **密码信封加密（M3）**：前端登录/引导/改密时自动拉取服务端公钥（`GET /api/v1/auth/pubkey`），使用 WebCrypto `RSA-OAEP(SHA-256)` 加密密码并附带时间戳防重放（私钥存于 `data/login.key`）；非安全上下文无 `crypto.subtle` 时自动平滑回退
 - **限速**：登录按「用户名+来源 IP」限速，连续失败 5 次起指数退避（5s 起，封顶 15 分钟）
-- **审计**：登录/登出/用户变更/源增删改/导入导出/手动同步 记录至 `data/audit.log`（JSONL，人可读）
+- **审计**：登录/登出/用户变更/源增删改/导入导出/手动同步/分享创建与撤销 记录至 `data/audit.log`（JSONL，人可读）
+
+## 分享外链（M3）
+
+- **创建分享**：管理员在文件列表操作栏点击「分享」，可设置**有效期**（小时，0 为永久）、**提取码**（可选，服务端 bcrypt 哈希存储）与**最大下载次数**（0 为不限）
+- **公开访问**：访客访问 `/s/{token}` 独立页面（无需登录账号），支持单文件流式下载、在线预览（预览不扣减下载次数）、文件夹一键 zip 流式打包下载
+- **安全防护**：提取码校验同样受 `token + IP` 指数退避限速保护；验证通过后下发 1 小时有效的 HMAC 签名 Grant Cookie；分享列表可在顶栏「分享管理」（`/shares`）中随时查看与一键撤销；关联文件源被删除时自动级联清理其分享链接
+
+## 核心设计一览
+
+- **统一驱动抽象**：`FSDriver` 接口 + 能力位（Capabilities），协议差异全部隔离在驱动层；写能力为可选 `Writer` 接口（`local`/`s3`/`webdav`/`gdrive`/`alipan`/`ftp`/`sftp` 均已实现）
+- **Path-to-ID 缓存底座**：针对 Google Drive、阿里云盘等以 `file_id` 寻址的云盘，`internal/driver/pathid` 提供并发安全的树形路径解析、列表预热与写后子树自动失效
+- **面向流**：下载全程 `io.Copy` 流式转发（1GB 文件实测服务端峰值内存 ~16MB），`http.ServeContent` 提供 Range/断点续传；zip 打包同为流式（不落盘不整载）
+- **直链模式**：`Presigner` 可选能力（`s3` 与 `alipan` 支持）+ `?direct=1` 302 跳转，省网关带宽
+- **凭据加密与自动轮转**：源配置敏感字段（含 `access_key`、`secret_key`、`password`、`private_key`、`refresh_token`、`client_secret`、`service_account_json`）全部 AES-256-GCM 加密落库；OAuth2 刷新产生的新 `refresh_token` 自动加密回写 `data/sources.json`
+
+## 技术栈
+
+Go 1.22+ / Gin · aws-sdk-go-v2（S3 协议族统一接入） · 标准库 WebDAV / Google Drive v3 / 阿里云盘 OpenAPI · jlaffaye/ftp（FTP/FTPS） · pkg/sftp + x/crypto/ssh（SFTP） · golang.org/x/crypto（bcrypt） · **Web 前端：Vue 3 + TypeScript + Element Plus + Pinia + Vue Router + Vite（`web/` 工程，含亮/暗模式与 5 种主题色切换，构建产物 `web/dist` 经 go:embed 内嵌单二进制；开发期 Vite proxy 代理 /api）** · 文件型原子持久化（sources.json / users.json / shares.json / index.json / audit.log）
 
 ## 索引缓存、同步与搜索（M1/M2）
 
@@ -127,14 +161,3 @@ go test ./...
 - 预览走 `GET /api/v1/sources/{id}/raw?path=...`，`Content-Disposition: inline` + 正确 `Content-Type` + CSP/nosniff 加固，支持 Range（视频拖动进度条可用）
 - 安全策略：白名单外的类型返回 415；HTML 文件强制按 `text/plain` 直出（脚本不执行）；文本预览限 2MB
 - 暂不支持：Office 文档（docx/xlsx/pptx，需前端重依赖，排在 M1+）、压缩包内部浏览
-
-## 核心设计一览
-
-- **统一驱动抽象**：`FSDriver` 接口 + 能力位（Capabilities），协议差异全部隔离在驱动层；写能力为可选 `Writer` 接口（local/s3/ftp/sftp 已实现）
-- **面向流**：下载全程 `io.Copy` 流式转发（1GB 文件实测服务端峰值内存 ~16MB），`http.ServeContent` 提供 Range/断点续传；zip 打包同为流式（不落盘不整载）
-- **直链模式**：`Presigner` 可选能力 + `?direct=1` 302 跳转，省网关带宽
-- **凭据加密**：源配置敏感字段 AES-256-GCM 加密落库（内存中明文仅供驱动使用，API 永不回显明文）；主密钥与 JWT 密钥分离存放
-
-## 技术栈
-
-Go 1.22+ / Gin · aws-sdk-go-v2（S3 协议族统一接入） · jlaffaye/ftp（FTP/FTPS） · pkg/sftp + x/crypto/ssh（SFTP） · golang.org/x/crypto（bcrypt） · **Web 前端：Vue 3 + TypeScript + Element Plus + Pinia + Vue Router + Vite（`web/` 工程，构建产物 `web/dist` 经 go:embed 内嵌单二进制；开发期 Vite proxy 代理 /api）** · 文件型存储（sources.json / users.json / index.json / audit.log，SQLite 视需求后置）

@@ -87,3 +87,42 @@ sources:
   #     # private_key: /home/me/.ssh/id_ed25519   # 方式二：私钥（PEM 文件路径或内容原文）
   #     # private_key_passphrase: xxx              # 私钥口令（无则省略）
   #     root: /var/www          # 可选，默认根
+
+  # —— WebDAV（坚果云 / Nextcloud / 群晖 NAS / OpenList）——
+  # - id: jianguoyun-demo
+  #   name: 坚果云
+  #   type: webdav
+  #   config:
+  #     endpoint: https://dav.jianguoyun.com/dav/我的坚果云   # 坚果云请勿直接挂载 /dav/ 根
+  #     username: your_email@example.com
+  #     password: <第三方应用专用密码>
+  #     root: ""                # 可选子路径
+  #     insecure_tls: false
+
+  # —— Google Drive（个人盘 OAuth2 或 Service Account JSON）——
+  # - id: gdrive-demo
+  #   name: Google Drive
+  #   type: gdrive
+  #   config:
+  #     auth_type: oauth2       # oauth2 或 service_account
+  #     client_id: <GOOGLE_CLIENT_ID>
+  #     client_secret: <GOOGLE_CLIENT_SECRET>
+  #     refresh_token: <GOOGLE_REFRESH_TOKEN>
+  #     # service_account_json: '{"type":"service_account",...}'
+  #     root_folder_id: root    # 默认 root，可填指定文件夹 ID
+  #     drive_id: ""            # 团队共享盘 Shared Drive ID（可选）
+  #     proxy_url: http://127.0.0.1:7890   # 国内环境可选代理
+
+  # —— 阿里云盘（官方 OpenAPI）——
+  # - id: alipan-demo
+  #   name: 阿里云盘
+  #   type: alipan
+  #   config:
+  #     drive_type: backup      # backup（备份盘）或 resource（资源库）
+  #     refresh_token: <ALIPAN_REFRESH_TOKEN>
+  #     # 方式一：自建开放平台应用
+  #     client_id: <APP_ID>
+  #     client_secret: <APP_SECRET>
+  #     # 方式二：三方 OAuth 令牌刷新代理（无 client_secret 时使用）
+  #     # oauth_token_url: https://api.example.com/alist/ali_open/token
+  #     root_folder_id: root

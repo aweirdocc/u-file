@@ -49,8 +49,8 @@ export const addSource = (id: string, name: string, type: string, config: Record
 export const updateSource = (id: string, name: string, config: Record<string, unknown>) =>
   put<Source>(`/api/v1/sources/${enc(id)}`, { name, config })
 export const removeSource = (id: string) => del<{ ok: boolean }>(`/api/v1/sources/${enc(id)}`)
-export const testSource = (type: string, config: Record<string, unknown>) =>
-  post<TestResult>('/api/v1/sources/test', { type, config })
+export const testSource = (type: string, config: Record<string, unknown>, id?: string) =>
+  post<TestResult>('/api/v1/sources/test', id ? { id, type, config } : { type, config })
 export const exportUrl = (redact: boolean) => `/api/v1/sources/export${redact ? '?redact=1' : ''}`
 export const exportText = (redact: boolean) => getText(exportUrl(redact))
 export const importSources = (content: string, overwrite: boolean) =>
