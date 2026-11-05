@@ -2,10 +2,12 @@
 import { computed } from 'vue'
 import { useRoute } from 'vue-router'
 import AppHeader from './components/AppHeader.vue'
+import TaskCenterFloat from './components/TaskCenterFloat.vue'
 
 const route = useRoute()
 // 公开分享页/登录页不显示平台 header（各自自带布局）
 const hideHeader = computed(() => !!route.meta.standalone)
+const hideTaskFloat = computed(() => !!route.meta.public)
 </script>
 
 <template>
@@ -13,6 +15,7 @@ const hideHeader = computed(() => !!route.meta.standalone)
     <div class="app-shell">
       <AppHeader v-if="!hideHeader" />
       <router-view />
+      <TaskCenterFloat v-if="!hideTaskFloat" />
     </div>
   </el-config-provider>
 </template>

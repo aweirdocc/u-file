@@ -5,6 +5,7 @@ package api
 
 import (
 	"archive/zip"
+	"context"
 	"errors"
 	"io"
 	"mime"
@@ -17,7 +18,10 @@ import (
 
 	"ufile/internal/auth"
 	"ufile/internal/driver"
+	"ufile/internal/fulltext"
+	"ufile/internal/mount"
 	"ufile/internal/source"
+	"ufile/internal/webhook"
 )
 
 // writerOf 探测驱动写能力。
@@ -86,11 +90,33 @@ func (s *Server) upload(c *gin.Context) {
 		}
 		results = append(results, gin.H{"file": name, "ok": true, "path": target})
 		okCount++
+		if s.fulltext != nil && fulltext.IsSupportedExt(name) && fh.Size <= 10<<20 {
+			go func(srcID, filePath, fileName string, fileSize int64, drv driver.FSDriver) {
+				origPath := filePath
+				if srcID == mount.VirtualSourceID && s.mounts != nil {
+					if r, err := s.mounts.Resolve(filePath); err == nil && r != nil {
+						srcID = r.Mount.SourceID
+						filePath = r.PhysicalPath
+					}
+				}
+				if text, err := fulltext.ExtractFromDriver(context.Background(), drv, origPath, fileName); err == nil && text != "" {
+					s.fulltext.UpsertDoc(srcID, driver.Entry{
+						Path:    filePath,
+						Name:    fileName,
+						Size:    fileSize,
+						ModTime: time.Now(),
+					}, text)
+				}
+			}(src.ID, target, name, fh.Size, src.Driver())
+		}
 	}
 	s.auditAction(c, "file.upload", gin.H{"source": src.ID, "dir": dir, "ok": okCount, "failed": failCount})
 	// 上传后立即失效该目录缓存，浏览即时可见
 	if s.index != nil {
 		s.index.Invalidate(src.ID)
+	}
+	if okCount > 0 {
+		s.emitWebhook(webhook.EventFileUploaded, src.ID, gin.H{"dir": dir, "uploaded": okCount, "items": results, "user": s.currentUsername(c)})
 	}
 	status := http.StatusOK
 	if okCount == 0 && failCount > 0 {
@@ -176,10 +202,16 @@ func (s *Server) deleteEntries(c *gin.Context) {
 		}
 		results = append(results, gin.H{"path": p, "ok": true})
 		okCount++
+		if s.fulltext != nil {
+			s.fulltext.RemoveDoc(src.ID, p)
+		}
 	}
 	s.auditAction(c, "file.delete", gin.H{"source": src.ID, "ok": okCount, "failed": failCount})
 	if s.index != nil {
 		s.index.Invalidate(src.ID)
+	}
+	if okCount > 0 {
+		s.emitWebhook(webhook.EventFileDeleted, src.ID, gin.H{"deleted": okCount, "paths": req.Paths, "user": s.currentUsername(c)})
 	}
 	c.JSON(http.StatusOK, gin.H{"ok": failCount == 0, "deleted": okCount, "failed": failCount, "items": results})
 }
@@ -221,6 +253,10 @@ func (s *Server) renameEntry(c *gin.Context) {
 	if s.index != nil {
 		s.index.Invalidate(src.ID)
 	}
+	if s.fulltext != nil {
+		s.fulltext.RemoveDoc(src.ID, req.From)
+	}
+	s.emitWebhook(webhook.EventFileRenamed, src.ID, gin.H{"from": req.From, "to": req.To, "user": s.currentUsername(c)})
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 

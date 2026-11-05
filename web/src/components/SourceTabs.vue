@@ -1,6 +1,7 @@
 <script setup lang="ts">
 // 源标签栏：胶囊高亮当前源；admin hover 显示编辑/删除。
 import { ref } from 'vue'
+import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Edit, Delete } from '@element-plus/icons-vue'
 import { useBrowseStore } from '../stores/browse'
@@ -12,6 +13,7 @@ const emit = defineEmits<{ select: [source: string, path: string] }>()
 
 const browse = useBrowseStore()
 const auth = useAuthStore()
+const router = useRouter()
 const editTarget = ref<string | null>(null)
 const dialogVisible = ref(false)
 
@@ -20,6 +22,10 @@ function onSelect(id: string) {
 }
 
 function onEdit(id: string) {
+  if (id === '@vfs') {
+    router.push('/platform')
+    return
+  }
   editTarget.value = id
   dialogVisible.value = true
 }
@@ -60,8 +66,8 @@ async function onDelete(id: string) {
         {{ s.name || s.id }}
         <span class="src-type">· {{ s.type }}</span>
         <template v-if="auth.isAdmin">
-          <el-icon class="op" title="编辑" @click.stop="onEdit(s.id)"><Edit /></el-icon>
-          <el-icon class="op danger" title="删除" @click.stop="onDelete(s.id)"><Delete /></el-icon>
+          <el-icon class="op" :title="s.id === '@vfs' ? '管理虚拟挂载点' : '编辑'" @click.stop="onEdit(s.id)"><Edit /></el-icon>
+          <el-icon v-if="s.id !== '@vfs'" class="op danger" title="删除" @click.stop="onDelete(s.id)"><Delete /></el-icon>
         </template>
       </el-tag>
     </template>

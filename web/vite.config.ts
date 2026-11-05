@@ -9,6 +9,14 @@ export default defineConfig({
   build: {
     outDir: 'dist',
     emptyOutDir: true,
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          'vendor-element': ['element-plus', '@element-plus/icons-vue'],
+          'vendor-core': ['vue', 'vue-router', 'pinia'],
+        },
+      },
+    },
   },
   server: {
     port: 5173,

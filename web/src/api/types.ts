@@ -93,10 +93,12 @@ export interface SearchHit {
   is_dir: boolean
   size: number
   mod_time: string
+  snippet?: string
 }
 
 export interface SearchResponse {
   query: string
+  mode?: 'filename' | 'fulltext'
   count: number
   hits: SearchHit[]
 }
@@ -250,3 +252,136 @@ export interface OfficeResult {
   xlsx?: XlsxBook
   pptx?: PptxDeck
 }
+
+// —— M4.1 传输任务中心与跨源流转 ——
+
+export type TaskType = 'copy' | 'move' | 'upload'
+export type TaskStatus = 'pending' | 'running' | 'paused' | 'retrying' | 'success' | 'failed' | 'canceled'
+
+export interface TaskItem {
+  id: string
+  type: TaskType
+  status: TaskStatus
+  user_id?: string
+  source_id: string
+  target_source_id?: string
+  paths: string[]
+  dst_dir: string
+  total_bytes: number
+  done_bytes: number
+  total_files: number
+  done_files: number
+  speed_bps: number
+  current_file?: string
+  error?: string
+  retries?: number
+  created_at: string
+  updated_at?: string
+  /** 是否为浏览器本地上传任务 */
+  is_local_upload?: boolean
+}
+
+export interface TransferTaskInput {
+  type: 'copy' | 'move'
+  source_id: string
+  target_source_id: string
+  paths: string[]
+  dst_dir: string
+}
+
+// —— M4.2 开放 API Token ——
+
+export type TokenScope =
+  | 'files:read'
+  | 'files:write'
+  | 'files:delete'
+  | 'sources:read'
+  | 'shares:manage'
+
+export interface APITokenInfo {
+  id: string
+  name: string
+  token_prefix: string
+  created_by: string
+  scopes: TokenScope[]
+  allowed_sources: string[]
+  ip_whitelist?: string[]
+  expires_at?: string
+  last_used_at?: string
+  last_used_ip?: string
+  revoked: boolean
+  created_at: string
+}
+
+export interface CreateAPITokenInput {
+  name: string
+  scopes: TokenScope[]
+  allowed_sources: string[]
+  ip_whitelist?: string[]
+  ttl_hours: number
+}
+
+export interface CreateAPITokenResponse {
+  token: APITokenInfo
+  plain_token: string
+}
+
+// —— M4.2 事件 Webhook ——
+
+export interface WebhookEndpoint {
+  id: string
+  name: string
+  url: string
+  secret?: string
+  events: string[]
+  enabled: boolean
+  last_status?: number
+  last_error?: string
+  last_fired_at?: string
+  created_at: string
+}
+
+export interface UpsertWebhookInput {
+  name: string
+  url: string
+  secret?: string
+  events: string[]
+  enabled: boolean
+}
+
+export interface WebhookTestResult {
+  ok: boolean
+  status_code: number
+  latency_ms: number
+  error?: string
+}
+
+// —— M4.3 虚拟多挂载点树 VFS ——
+
+export interface MountItem {
+  id: string
+  mount_path: string
+  source_id: string
+  source_path: string
+  readonly: boolean
+  remark?: string
+  created_at: string
+}
+
+export interface UpsertMountInput {
+  mount_path: string
+  source_id: string
+  source_path: string
+  readonly: boolean
+  remark?: string
+}
+
+// —— M4.3 全文检索引擎 ——
+
+export interface FullTextStatus {
+  running: boolean
+  indexed_docs: number
+  total_postings: number
+  last_indexed_at?: string
+}
+

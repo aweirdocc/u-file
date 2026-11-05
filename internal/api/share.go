@@ -14,6 +14,7 @@ import (
 
 	"ufile/internal/auth"
 	"ufile/internal/share"
+	"ufile/internal/webhook"
 )
 
 // publicShare 把存储记录转为对外视图（不暴露哈希与创建者以外的内部信息）。
@@ -92,6 +93,7 @@ func (s *Server) createShare(c *gin.Context) {
 		return
 	}
 	s.auditAction(c, "share.create", gin.H{"id": sh.ID, "source": src.ID, "path": req.Path, "has_password": sh.HasPassword(), "max_downloads": sh.MaxDownloads})
+	s.emitWebhook(webhook.EventShareCreated, src.ID, publicShare(sh))
 	c.JSON(http.StatusCreated, publicShare(sh))
 }
 
@@ -135,6 +137,7 @@ func (s *Server) deleteShare(c *gin.Context) {
 		return
 	}
 	s.auditAction(c, "share.delete", gin.H{"id": id})
+	s.emitWebhook(webhook.EventShareDeleted, "", gin.H{"id": id, "user": username})
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 

@@ -16,13 +16,18 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"ufile/internal/apitoken"
 	"ufile/internal/audit"
 	"ufile/internal/auth"
 	"ufile/internal/driver"
+	"ufile/internal/fulltext"
 	"ufile/internal/index"
+	"ufile/internal/mount"
 	"ufile/internal/share"
 	"ufile/internal/source"
+	"ufile/internal/task"
 	"ufile/internal/thumb"
+	"ufile/internal/webhook"
 )
 
 // textLikeExtensions 视为文本预览的扩展名（前端按此判断，后端兜底嗅探）。
@@ -86,18 +91,28 @@ type Server struct {
 	sources   *source.Manager
 	auth      *auth.Store
 	audit     *audit.Log
-	index     *index.Cache   // 可为 nil（未启用索引缓存）
-	shares    *share.Manager // 可为 nil（未启用分享外链）
-	thumbs    *thumb.Cache   // 内存缩略图缓存
-	webFS     fs.FS          // 前端静态资源（Vue 构建产物）
-	indexHTML []byte         // 入口 index.html（启动时读入）
+	index     *index.Cache       // 可为 nil（未启用索引缓存）
+	shares    *share.Manager     // 可为 nil（未启用分享外链）
+	thumbs    *thumb.Cache       // 内存缩略图缓存
+	tasks     *task.Manager      // M4.1 传输任务中心
+	tokens    *apitoken.Manager  // M4.2 开放 API Token
+	webhooks  *webhook.Manager   // M4.2 事件 Webhook
+	mounts    *mount.Manager     // M4.3 虚拟多挂载点树 VFS
+	fulltext  *fulltext.Engine   // M4.3 全文检索引擎
+	webFS     fs.FS              // 前端静态资源（Vue 构建产物）
+	indexHTML []byte             // 入口 index.html（启动时读入）
 }
 
 // New 构造 API 服务。authStore/auditLog 可为 nil（无鉴权模式）；
 // indexCache/sharesMgr 可为 nil（未启用索引缓存/分享外链）；webFS 为前端静态资源（必传）。
-func New(cfgSources *source.Manager, authStore *auth.Store, auditLog *audit.Log, indexCache *index.Cache, sharesMgr *share.Manager, webFS fs.FS) (*Server, error) {
+func New(cfgSources *source.Manager, authStore *auth.Store, auditLog *audit.Log, indexCache *index.Cache, sharesMgr *share.Manager, webFS fs.FS, opts ...Option) (*Server, error) {
 	gin.SetMode(gin.ReleaseMode)
 	s := &Server{engine: gin.New(), sources: cfgSources, auth: authStore, audit: auditLog, index: indexCache, shares: sharesMgr, thumbs: thumb.NewCache(512), webFS: webFS}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(s)
+		}
+	}
 	s.engine.Use(gin.Logger(), gin.Recovery())
 
 	s.engine.GET("/healthz", func(c *gin.Context) {
@@ -150,8 +165,8 @@ func New(cfgSources *source.Manager, authStore *auth.Store, auditLog *audit.Log,
 	grp.POST("/sources/:id/delete", authAny, s.deleteEntries)
 	grp.POST("/sources/:id/rename", authAny, s.renameEntry)
 
-	// —— 搜索（基于索引快照；按 ACL 过滤可见命中结果）——
-	if s.index != nil {
+	// —— 搜索（基于索引快照或全文检索引擎；按 ACL 过滤可见命中结果）——
+	if s.index != nil || s.fulltext != nil {
 		grp.GET("/search", authAny, s.search)
 	}
 
@@ -175,6 +190,9 @@ func New(cfgSources *source.Manager, authStore *auth.Store, auditLog *audit.Log,
 		grp.GET("/s/:token/thumb", s.shareThumb)
 		grp.GET("/s/:token/office", s.shareOffice)
 	}
+
+	// —— M4 增强特性路由（传输任务中心 / 开放 API Token / Webhook / 虚拟挂载 VFS / 全文检索）——
+	s.registerM4Routes(grp, authAdmin, authAny)
 
 	// —— 前端静态资源（Vue 构建产物，web/embed.go 内嵌 dist/）——
 	if s.webFS == nil {
@@ -212,16 +230,26 @@ func New(cfgSources *source.Manager, authStore *auth.Store, auditLog *audit.Log,
 // Handler 返回根 HTTP Handler。
 func (s *Server) Handler() http.Handler { return s.engine }
 
-// requireRole 鉴权中间件。auth 未启用时直接放行（本地联调模式）。
+// requireRole 鉴权中间件。auth 未启用时直接放行（本地联调模式；但若携带 uft_ API Token 仍走 Token 校验）。
 func (s *Server) requireRole(roles ...auth.Role) gin.HandlerFunc {
 	if s.auth == nil {
-		return func(c *gin.Context) { c.Next() }
+		return func(c *gin.Context) {
+			if tok := bearerToken(c.Request); apitoken.IsAPIToken(tok) {
+				s.verifyAPITokenAuth(c, tok, roles)
+				return
+			}
+			c.Next()
+		}
 	}
 	return func(c *gin.Context) {
 		tok := bearerToken(c.Request)
 		if tok == "" {
 			c.Header("WWW-Authenticate", `Bearer realm="u-file"`)
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"code": "UNAUTHORIZED", "message": "未登录"})
+			return
+		}
+		if apitoken.IsAPIToken(tok) {
+			s.verifyAPITokenAuth(c, tok, roles)
 			return
 		}
 		cl, err := s.auth.Verify(tok)
@@ -418,7 +446,11 @@ func (s *Server) logout(c *gin.Context) {
 }
 
 func (s *Server) resolveSource(c *gin.Context) (*source.Source, bool) {
-	src, err := s.sources.Get(c.Param("id"))
+	id := c.Param("id")
+	if id == mount.VirtualSourceID && s.mounts != nil {
+		return s.virtualSource(), true
+	}
+	src, err := s.sources.Get(id)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"code": "SOURCE_NOT_FOUND", "message": "文件源不存在"})
 		return nil, false
@@ -431,12 +463,21 @@ func (s *Server) resolveSource(c *gin.Context) (*source.Source, bool) {
 func (s *Server) listSources(c *gin.Context) {
 	all := s.sources.List()
 	if s.auth == nil {
+		if s.mounts != nil && s.mounts.Count() > 0 {
+			all = append([]*source.Source{s.virtualSource()}, all...)
+		}
 		c.JSON(http.StatusOK, all)
 		return
 	}
 	user := s.currentUsername(c)
 	admin := s.isAdmin(c)
-	out := make([]sourceView, 0, len(all))
+	out := make([]sourceView, 0, len(all)+1)
+	if s.mounts != nil && s.mounts.Count() > 0 && s.checkVFSAccessible(user, admin) {
+		out = append(out, sourceView{
+			Source: s.virtualSource(),
+			Access: &auth.SourceAccess{Actions: []auth.Action{auth.ActionRead, auth.ActionWrite, auth.ActionDelete}},
+		})
+	}
 	for _, src := range all {
 		acc := s.auth.SourceAccessOf(user, src.ID)
 		if acc == nil {
@@ -466,7 +507,11 @@ func (s *Server) getSource(c *gin.Context) {
 		if !s.isAdmin(c) {
 			out.Config = nil
 		}
-		acc = s.auth.SourceAccessOf(s.currentUsername(c), src.ID)
+		if src.ID == mount.VirtualSourceID {
+			acc = &auth.SourceAccess{Actions: []auth.Action{auth.ActionRead, auth.ActionWrite, auth.ActionDelete}}
+		} else {
+			acc = s.auth.SourceAccessOf(s.currentUsername(c), src.ID)
+		}
 	}
 	c.JSON(http.StatusOK, sourceView{Source: out, Access: acc})
 }
@@ -608,7 +653,11 @@ func (s *Server) listFiles(c *gin.Context) {
 	}
 	p := c.Query("path")
 	var entryFilter func(entryPath string, isDir bool) bool
-	if s.auth != nil && !s.auth.CanAccess(s.currentUsername(c), src.ID, p, auth.ActionRead) {
+	if _, isTok := c.Get("api_token"); isTok || src.ID == mount.VirtualSourceID {
+		if !s.checkPathAccess(c, src.ID, p, auth.ActionRead) {
+			return
+		}
+	} else if s.auth != nil && !s.auth.CanAccess(s.currentUsername(c), src.ID, p, auth.ActionRead) {
 		isAnc, flt := s.auth.IsAncestorOfAllowed(s.currentUsername(c), src.ID, p)
 		if !isAnc {
 			s.checkPathAccess(c, src.ID, p, auth.ActionRead)
@@ -668,7 +717,13 @@ func (s *Server) syncTrigger(c *gin.Context) {
 	if !ok {
 		return
 	}
-	go s.index.SyncSource(context.Background(), src.ID, src.Driver())
+	go func() {
+		s.index.SyncSource(context.Background(), src.ID, src.Driver())
+		if s.fulltext != nil && src.ID != mount.VirtualSourceID {
+			s.fulltext.IndexSource(context.Background(), src.ID, src.Driver())
+		}
+		s.emitWebhook(webhook.EventSyncCompleted, src.ID, gin.H{"source_id": src.ID})
+	}()
 	s.auditAction(c, "index.sync_trigger", gin.H{"id": src.ID})
 	c.JSON(http.StatusAccepted, gin.H{"ok": true, "message": "同步已开始"})
 }
@@ -845,6 +900,10 @@ func (s *Server) fail(c *gin.Context, err error) {
 		c.JSON(http.StatusNotFound, gin.H{"code": "NOT_FOUND", "message": "对象不存在"})
 	case errors.Is(err, driver.ErrInvalidPath):
 		c.JSON(http.StatusBadRequest, gin.H{"code": "INVALID_PATH", "message": "非法路径"})
+	case errors.Is(err, mount.ErrMountReadOnly):
+		c.JSON(http.StatusForbidden, gin.H{"code": "MOUNT_READONLY", "message": err.Error()})
+	case errors.Is(err, mount.ErrVirtualNavDir):
+		c.JSON(http.StatusBadRequest, gin.H{"code": "VIRTUAL_NAV_DIR", "message": err.Error()})
 	default:
 		c.JSON(http.StatusBadGateway, gin.H{"code": "UPSTREAM_ERROR", "message": err.Error()})
 	}

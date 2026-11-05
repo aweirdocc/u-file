@@ -230,9 +230,70 @@ func (d *Local) Rename(ctx context.Context, from, to string) error {
 }
 
 func (d *Local) copyFileFallback(src, dst string, origErr error) error {
+	if err := copySingleFile(src, dst); err != nil {
+		return origErr
+	}
+	return os.Remove(src)
+}
+
+// isSubOrSamePath 判断 sub 是否与 parent 相同或是其子路径。
+func isSubOrSamePath(sub, parent string) bool {
+	rel, err := filepath.Rel(parent, sub)
+	if err != nil {
+		return false
+	}
+	if rel == "." {
+		return true
+	}
+	return !strings.HasPrefix(rel, "..") && !filepath.IsAbs(rel)
+}
+
+// Copy 同一本地源内复制文件或目录（实现 driver.Copier）。
+func (d *Local) Copy(ctx context.Context, from, to string) error {
+	src, err := d.resolve(from)
+	if err != nil {
+		return err
+	}
+	if src == filepath.Clean(d.root) {
+		return driver.ErrInvalidPath
+	}
+	dst, err := d.resolve(to)
+	if err != nil {
+		return err
+	}
+	if dst == filepath.Clean(d.root) || isSubOrSamePath(dst, src) {
+		return driver.ErrInvalidPath
+	}
+	info, err := os.Stat(src)
+	if err != nil {
+		return mapErr(err)
+	}
+	if !info.IsDir() {
+		return copySingleFile(src, dst)
+	}
+	return filepath.WalkDir(src, func(p string, de fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		rel, err := filepath.Rel(src, p)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(dst, rel)
+		if de.IsDir() {
+			return os.MkdirAll(target, 0o755)
+		}
+		return copySingleFile(p, target)
+	})
+}
+
+func copySingleFile(src, dst string) error {
 	in, err := os.Open(src)
 	if err != nil {
-		return origErr
+		return mapErr(err)
 	}
 	defer in.Close()
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
@@ -247,7 +308,7 @@ func (d *Local) copyFileFallback(src, dst string, origErr error) error {
 		os.Remove(dst)
 		return err
 	}
-	return os.Remove(src)
+	return nil
 }
 
 func mapErr(err error) error {

@@ -91,3 +91,9 @@ type Writer interface {
 	Mkdir(ctx context.Context, path string) error
 	Rename(ctx context.Context, from, to string) error
 }
+
+// Copier 是可选能力：同一文件源内的服务端直接复制（如 S3 CopyObject、本地文件复制），
+// 避免跨源网关先下载再上传的带宽与时间开销。
+type Copier interface {
+	Copy(ctx context.Context, from, to string) error
+}

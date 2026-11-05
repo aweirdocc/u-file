@@ -18,14 +18,19 @@ import (
 	"time"
 
 	"ufile/internal/api"
+	"ufile/internal/apitoken"
 	"ufile/internal/audit"
 	"ufile/internal/auth"
 	"ufile/internal/config"
 	"ufile/internal/crypt"
 	"ufile/internal/driver"
+	"ufile/internal/fulltext"
 	"ufile/internal/index"
+	"ufile/internal/mount"
 	"ufile/internal/share"
 	"ufile/internal/source"
+	"ufile/internal/task"
+	"ufile/internal/webhook"
 	"ufile/web"
 
 	// 统一注册所有内建驱动（init 时写入 driver 注册表）
@@ -102,6 +107,36 @@ func main() {
 		log.Fatalf("初始化审计日志失败: %v", err)
 	}
 
+	// 虚拟多挂载点树 VFS（M4.3）：data/mounts.json
+	mntMgr, err := mount.NewManager((*dataDir), func(id string) (driver.FSDriver, error) {
+		src, err := mgr.Get(id)
+		if err != nil {
+			return nil, err
+		}
+		return src.Driver(), nil
+	})
+	if err != nil {
+		log.Fatalf("初始化虚拟挂载管理器失败: %v", err)
+	}
+
+	// 全文检索引擎（M4.3）：data/fulltext/index.json
+	ftEngine, err := fulltext.NewEngine((*dataDir))
+	if err != nil {
+		log.Fatalf("初始化全文检索引擎失败: %v", err)
+	}
+
+	// 开放 API Token（M4.2）：data/tokens.json
+	tokMgr, err := apitoken.NewManager((*dataDir))
+	if err != nil {
+		log.Fatalf("初始化 API Token 管理器失败: %v", err)
+	}
+
+	// 事件 Webhook（M4.2）：data/webhooks.json
+	whMgr, err := webhook.NewManager((*dataDir), webhook.Config{})
+	if err != nil {
+		log.Fatalf("初始化 Webhook 管理器失败: %v", err)
+	}
+
 	// 索引缓存（M1）：目录 TTL 缓存 + 后台定时全量同步 + 快照持久化。
 	idxCache := index.New((*dataDir), index.Config{
 		TTL:        10 * time.Minute,
@@ -109,14 +144,52 @@ func main() {
 		Snapshot:   true,
 		MaxEntries: 10000,
 	}, mgr.IDs, func(id string) (driver.FSDriver, bool) {
+		if id == mount.VirtualSourceID {
+			return mntMgr, true
+		}
 		src, err := mgr.Get(id)
 		if err != nil {
 			return nil, false
 		}
 		return src.Driver(), true
 	})
-	// 源删除时联动清理索引（复用 Manager 的删除钩子）
-	mgr.OnRemove = idxCache.Forget
+
+	// 传输任务中心（M4.1）：data/tasks.json
+	taskMgr, err := task.NewManager((*dataDir), task.Config{}, func(id string) (driver.FSDriver, error) {
+		if id == mount.VirtualSourceID {
+			return mntMgr, nil
+		}
+		src, err := mgr.Get(id)
+		if err != nil {
+			return nil, err
+		}
+		return src.Driver(), nil
+	}, func(tk *task.Task) {
+		idxCache.Invalidate(tk.SourceID)
+		idxCache.Invalidate(tk.TargetSourceID)
+		if tk.Status == task.StatusSuccess {
+			whMgr.Emit(webhook.EventFileTransferred, tk.TargetSourceID, map[string]any{
+				"task_id":          tk.ID,
+				"type":             tk.Type,
+				"source_id":        tk.SourceID,
+				"target_source_id": tk.TargetSourceID,
+				"paths":            tk.Paths,
+				"dst_dir":          tk.DstDir,
+				"total_bytes":      tk.TotalBytes,
+				"user":             tk.UserID,
+			})
+		}
+	})
+	if err != nil {
+		log.Fatalf("初始化传输任务中心失败: %v", err)
+	}
+
+	// 源删除时联动清理索引、挂载点与全文索引（复用 Manager 的删除钩子）
+	mgr.OnRemove = func(id string) {
+		idxCache.Forget(id)
+		mntMgr.RemoveBySource(id)
+		ftEngine.ForgetSource(id)
+	}
 
 	// 分享外链（M3）：data/shares.json；grant cookie 签名复用 jwt.key（独立主密钥会多一个要备份的文件）
 	shareMgr, err := share.NewManager((*dataDir), jwtSecret)
@@ -136,7 +209,13 @@ func main() {
 		}
 	}
 
-	srv, err := api.New(mgr, authStore, auditLog, idxCache, shareMgr, webFS)
+	srv, err := api.New(mgr, authStore, auditLog, idxCache, shareMgr, webFS,
+		api.WithTasks(taskMgr),
+		api.WithAPITokens(tokMgr),
+		api.WithWebhooks(whMgr),
+		api.WithMounts(mntMgr),
+		api.WithFullText(ftEngine),
+	)
 	if err != nil {
 		log.Fatalf("初始化失败: %v", err)
 	}
@@ -153,10 +232,22 @@ func main() {
 	idxCache.Start(ctxSync)
 
 	go func() {
-		log.Printf("u-file M1 已启动: http://localhost%s", address)
+		log.Printf("u-file M4 已启动: http://localhost%s", address)
 		log.Printf("已接入 %d 个文件源；鉴权已启用（首次访问 Web 会引导创建管理员）", len(cfg.Sources))
 		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("HTTP 服务异常退出: %v", err)
+		}
+	}()
+
+	// 启动后后台低优增量构建一次全文索引
+	go func() {
+		for _, id := range mgr.IDs() {
+			if ctxSync.Err() != nil {
+				return
+			}
+			if src, err := mgr.Get(id); err == nil {
+				ftEngine.IndexSource(ctxSync, src.ID, src.Driver())
+			}
 		}
 	}()
 
@@ -166,6 +257,8 @@ func main() {
 	log.Println("正在关闭……")
 	stopSync()
 	idxCache.Stop()
+	taskMgr.Stop()
+	whMgr.Stop()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = httpSrv.Shutdown(ctx)

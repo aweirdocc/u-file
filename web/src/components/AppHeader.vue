@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
-import { Search, User, UserFilled, SwitchButton, Plus, Download, Upload as UploadIcon, Share } from '@element-plus/icons-vue'
+import { Search, User, UserFilled, SwitchButton, Plus, Download, Upload as UploadIcon, Share, Connection } from '@element-plus/icons-vue'
 import { useAuthStore } from '../stores/auth'
 import { useBrowseStore } from '../stores/browse'
 import { downloadHref, exportUrl } from '../api/exportHelpers'
@@ -16,12 +16,17 @@ const router = useRouter()
 const route = useRoute()
 
 const searchText = ref('')
+const searchMode = ref<'filename' | 'fulltext'>('filename')
 const sourceDialogVisible = ref(false)
 
 function onSearch() {
   const q = searchText.value.trim()
-  if (q) browse.runSearch(q)
-  else browse.exitSearch()
+  if (q) {
+    if (route.meta.standalone) router.push('/')
+    browse.runSearch(q, searchMode.value)
+  } else {
+    browse.exitSearch()
+  }
 }
 
 function openAddSource() {
@@ -47,19 +52,26 @@ function doExportDownload(redact: boolean) {
     <a class="brand" href="/" @click.prevent="router.push('/')">
       <span class="logo">🗂</span>
       <b>u-file</b>
-      <el-tag size="small" type="info" effect="dark">M3</el-tag>
+      <el-tag size="small" type="primary" effect="dark">M4</el-tag>
       <span class="subtitle">统一文件管理服务平台</span>
     </a>
 
     <el-input
       v-model="searchText"
       class="search-box"
-      placeholder="搜索文件名（回车）"
+      :placeholder="searchMode === 'fulltext' ? '全文检索文档内容（回车）' : '搜索文件名（回车）'"
       :prefix-icon="Search"
       clearable
       @keydown.enter="onSearch"
       @clear="browse.exitSearch()"
-    />
+    >
+      <template #prepend>
+        <el-select v-model="searchMode" style="width: 86px" @change="() => { if (searchText.trim()) onSearch() }">
+          <el-option label="文件名" value="filename" />
+          <el-option label="全文" value="fulltext" />
+        </el-select>
+      </template>
+    </el-input>
 
     <div class="actions">
       <template v-if="auth.isLoggedIn">
@@ -70,6 +82,9 @@ function doExportDownload(redact: boolean) {
           </span>
           <template #dropdown>
             <el-dropdown-menu>
+              <el-dropdown-item v-if="auth.isAdmin" :icon="Connection" @click="router.push('/platform')">
+                开放生态与挂载 (M4)
+              </el-dropdown-item>
               <el-dropdown-item v-if="auth.isAdmin" :icon="UserFilled" @click="router.push('/users')">
                 用户与权限管理
               </el-dropdown-item>
@@ -83,6 +98,16 @@ function doExportDownload(redact: boolean) {
       </template>
 
       <ThemeToggle />
+
+      <el-button
+        v-if="auth.isAdmin"
+        :type="route.path === '/platform' ? 'primary' : 'default'"
+        :plain="route.path === '/platform'"
+        :icon="Connection"
+        @click="router.push('/platform')"
+      >
+        开放与挂载
+      </el-button>
 
       <el-button
         v-if="auth.isAdmin"
@@ -137,7 +162,7 @@ function doExportDownload(redact: boolean) {
 }
 .logo { font-size: 20px; }
 .subtitle { color: var(--ufile-header-muted); font-size: 12px; margin-left: 4px; }
-.search-box { max-width: 300px; margin-left: 16px; }
+.search-box { max-width: 360px; margin-left: 16px; }
 .actions { margin-left: auto; display: flex; align-items: center; gap: 8px; }
 .user-chip {
   color: var(--ufile-header-chip);

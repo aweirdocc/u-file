@@ -1,10 +1,14 @@
 // 后端 API 调用函数全集。
-import { get, post, put, del, getText, upload } from './client'
+import { get, post, put, del, getText, upload, getToken } from './client'
 import { encryptPassword } from '../utils/crypto'
 import type {
   Source, Entry, ListResult, TestResult, ImportReport,
   SyncStatus, SearchResponse, AuthStatus, Me, UserInfo,
   CreateUserInput, UpdateUserInput, Policy, ShareInfo, OfficeResult,
+  TaskItem, TransferTaskInput,
+  APITokenInfo, CreateAPITokenInput, CreateAPITokenResponse,
+  WebhookEndpoint, UpsertWebhookInput, WebhookTestResult,
+  MountItem, UpsertMountInput, FullTextStatus,
 } from './types'
 
 const enc = encodeURIComponent
@@ -94,6 +98,48 @@ export function uploadFiles(source: string, path: string, files: File[]) {
   return upload(`/api/v1/sources/${enc(source)}/upload`, form)
 }
 
+/** 带实时进度的 XHR 多文件上传（供任务中心统一接管上传进度条与速率）。 */
+export function uploadFilesWithProgress(
+  source: string,
+  path: string,
+  files: File[],
+  onProgress?: (loaded: number, total: number) => void,
+  signal?: AbortSignal,
+): Promise<{ ok: boolean; uploaded: number; failed: number; items: { file: string; ok: boolean; error?: string }[] }> {
+  return new Promise((resolve, reject) => {
+    const form = new FormData()
+    form.append('path', path)
+    for (const f of files) form.append('file', f)
+
+    const xhr = new XMLHttpRequest()
+    xhr.open('POST', `/api/v1/sources/${enc(source)}/upload`, true)
+    const tok = getToken()
+    if (tok) xhr.setRequestHeader('Authorization', 'Bearer ' + tok)
+
+    if (signal) {
+      signal.addEventListener('abort', () => xhr.abort(), { once: true })
+    }
+
+    xhr.upload.onprogress = (ev) => {
+      if (ev.lengthComputable && onProgress) {
+        onProgress(ev.loaded, ev.total)
+      }
+    }
+    xhr.onload = () => {
+      let data: any = {}
+      try { data = JSON.parse(xhr.responseText || '{}') } catch { /* ignore */ }
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve(data)
+      } else {
+        reject(new Error(data.message || `${xhr.status} ${xhr.statusText}`))
+      }
+    }
+    xhr.onerror = () => reject(new Error('网络错误：上传中断'))
+    xhr.onabort = () => reject(new Error('上传已取消'))
+    xhr.send(form)
+  })
+}
+
 // —— 下载 / 预览 / 直链 / 打包（原生导航 URL 构造）——
 
 export const downloadUrl = (source: string, path: string) =>
@@ -124,8 +170,11 @@ export async function presign(source: string, path: string): Promise<{ url: stri
 
 export const getSyncStatus = (source: string) => get<SyncStatus>(`/api/v1/sources/${enc(source)}/sync`)
 export const triggerSync = (source: string) => post<{ ok: boolean }>(`/api/v1/sources/${enc(source)}/sync`)
-export const search = (q: string, limit = 100) =>
-  get<SearchResponse>(`/api/v1/search?q=${enc(q)}&limit=${limit}`)
+export const search = (q: string, limit = 100, mode: 'filename' | 'fulltext' = 'filename', source = '') => {
+  const qs = new URLSearchParams({ q, limit: String(limit), mode })
+  if (source) qs.set('source', source)
+  return get<SearchResponse>(`/api/v1/search?${qs}`)
+}
 
 // —— 分享外链（管理面）——
 
@@ -136,5 +185,50 @@ export const deleteShare = (id: string) => del<{ ok: boolean }>(`/api/v1/shares/
 
 /** 访客页公开信息（无登录；404/410 交给调用方按状态处理） */
 export const shareUrl = (token: string) => `/s/${enc(token)}`
+
+// —— M4.1 传输任务中心与跨源流转 ——
+
+export const listTasks = () => get<TaskItem[]>('/api/v1/tasks')
+export const submitTransferTask = (input: TransferTaskInput) =>
+  post<TaskItem>('/api/v1/tasks/transfer', input)
+export const pauseTask = (id: string) => post<TaskItem>(`/api/v1/tasks/${enc(id)}/pause`)
+export const resumeTask = (id: string) => post<TaskItem>(`/api/v1/tasks/${enc(id)}/resume`)
+export const cancelTask = (id: string) => post<TaskItem>(`/api/v1/tasks/${enc(id)}/cancel`)
+export const retryTask = (id: string) => post<TaskItem>(`/api/v1/tasks/${enc(id)}/retry`)
+export const deleteTask = (id: string) => del<{ ok: boolean }>(`/api/v1/tasks/${enc(id)}`)
+export const clearFinishedTasks = () => post<{ ok: boolean; cleared: number }>('/api/v1/tasks/clear')
+
+// —— M4.2 开放 API Token ——
+
+export const listAPITokens = () => get<APITokenInfo[]>('/api/v1/tokens')
+export const createAPIToken = (input: CreateAPITokenInput) =>
+  post<CreateAPITokenResponse>('/api/v1/tokens', input)
+export const revokeAPIToken = (id: string) => post<{ ok: boolean }>(`/api/v1/tokens/${enc(id)}/revoke`)
+export const deleteAPIToken = (id: string) => del<{ ok: boolean }>(`/api/v1/tokens/${enc(id)}`)
+
+// —— M4.2 事件 Webhook ——
+
+export const listWebhooks = () => get<WebhookEndpoint[]>('/api/v1/webhooks')
+export const createWebhook = (input: UpsertWebhookInput) =>
+  post<WebhookEndpoint>('/api/v1/webhooks', input)
+export const updateWebhook = (id: string, input: UpsertWebhookInput) =>
+  put<WebhookEndpoint>(`/api/v1/webhooks/${enc(id)}`, input)
+export const deleteWebhook = (id: string) => del<{ ok: boolean }>(`/api/v1/webhooks/${enc(id)}`)
+export const testWebhook = (id: string) => post<WebhookTestResult>(`/api/v1/webhooks/${enc(id)}/test`)
+
+// —— M4.3 虚拟多挂载点树 VFS ——
+
+export const listMounts = () => get<MountItem[]>('/api/v1/mounts')
+export const createMount = (input: UpsertMountInput) =>
+  post<MountItem>('/api/v1/mounts', input)
+export const updateMount = (id: string, input: UpsertMountInput) =>
+  put<MountItem>(`/api/v1/mounts/${enc(id)}`, input)
+export const deleteMount = (id: string) => del<{ ok: boolean }>(`/api/v1/mounts/${enc(id)}`)
+
+// —— M4.3 全文检索引擎 ——
+
+export const getFullTextStatus = () => get<FullTextStatus>('/api/v1/fulltext/status')
+export const rebuildFullText = (sourceId = '') =>
+  post<{ ok: boolean; message: string }>('/api/v1/fulltext/rebuild', { source_id: sourceId })
 
 export type { Source, Entry }

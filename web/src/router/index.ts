@@ -17,6 +17,7 @@ const router = createRouter({
     { path: '/s/:token', component: () => import('../views/ShareView.vue'), meta: { public: true, standalone: true } },
     { path: '/users', component: () => import('../views/UsersView.vue'), meta: { standalone: true, requiresAdmin: true } },
     { path: '/shares', component: () => import('../views/SharesView.vue'), meta: { standalone: true, requiresShare: true } },
+    { path: '/platform', component: () => import('../views/PlatformView.vue'), meta: { standalone: true, requiresAdmin: true } },
     { path: '/:source', component: () => import('../views/BrowseView.vue') },
     // 捕获 /:source/任意深层路径（path 含 /）
     { path: '/:source/:path(.*)', component: () => import('../views/BrowseView.vue') },

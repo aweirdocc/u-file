@@ -17,6 +17,7 @@
 | [docs/03-技术可行性分析.md](./docs/03-技术可行性分析.md) | 技术栈选型、各类文件源逐项可行性、风险与缓解、结论 |
 | [docs/04-总体架构设计.md](./docs/04-总体架构设计.md) | 分层架构、驱动接口设计、数据模型、API 草案、安全与部署 |
 | [docs/05-云盘与WebDAV驱动设计.md](./docs/05-云盘与WebDAV驱动设计.md) | WebDAV（坚果云/NAS）、Google Drive、阿里云盘驱动架构与协议设计 |
+| [docs/06-M4中远期需求与架构设计.md](./docs/06-M4中远期需求与架构设计.md) | M4 / P3 中远期规划：传输任务中心、跨源流转、开放 Token/Webhook、VFS 挂载与全文检索 |
 | [docs/research/01-技术调研笔记.md](./docs/research/01-技术调研笔记.md) | 调研原始笔记（一手来源、带引用链接） |
 | [docs/m0-poc-验证记录.md](./docs/m0-poc-验证记录.md) | M0 PoC 冒烟与大文件内存验证记录 |
 

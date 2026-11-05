@@ -6,7 +6,9 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"ufile/internal/apitoken"
 	"ufile/internal/auth"
+	"ufile/internal/mount"
 	"ufile/internal/source"
 )
 
@@ -35,9 +37,68 @@ func (s *Server) isAdmin(c *gin.Context) bool {
 	return s.currentRole(c) == auth.RoleAdmin
 }
 
+// checkVFSAccessible 判断用户是否有权访问至少一个挂载点对应的物理源。
+func (s *Server) checkVFSAccessible(user string, admin bool) bool {
+	if s.mounts == nil || s.mounts.Count() == 0 {
+		return false
+	}
+	if s.auth == nil || admin {
+		return true
+	}
+	for _, m := range s.mounts.ListMounts() {
+		if s.auth.CanAccess(user, m.SourceID, m.SourcePath, auth.ActionRead) {
+			return true
+		}
+	}
+	return false
+}
+
+// checkAPITokenSource 检查 API Token（若当前请求使用 API Token）对指定源和操作的作用域限制。
+func (s *Server) checkAPITokenSource(c *gin.Context, sourceID string, act auth.Action) bool {
+	v, exists := c.Get("api_token")
+	if !exists {
+		return true
+	}
+	tok, ok := v.(*apitoken.Token)
+	if !ok || tok == nil {
+		return true
+	}
+	needScope := actionToTokenScope(act)
+	if !tok.HasScope(needScope) {
+		c.JSON(http.StatusForbidden, gin.H{"code": "SCOPE_FORBIDDEN", "message": "API Token 缺少执行该操作的作用域: " + string(needScope)})
+		return false
+	}
+	if sourceID != "" && sourceID != mount.VirtualSourceID && !tok.AllowsSource(sourceID) {
+		c.JSON(http.StatusForbidden, gin.H{"code": "SOURCE_FORBIDDEN", "message": "API Token 无权访问该文件源"})
+		return false
+	}
+	return true
+}
+
 // checkSourceAccess 检查当前登录用户是否对 sourceID 拥有 act 权限（不限子路径）。
 // 未通过时直接写入 403 响应并返回 false。
 func (s *Server) checkSourceAccess(c *gin.Context, sourceID string, act auth.Action) bool {
+	if !s.checkAPITokenSource(c, sourceID, act) {
+		return false
+	}
+	if sourceID == mount.VirtualSourceID {
+		if s.mounts == nil {
+			c.JSON(http.StatusNotFound, gin.H{"code": "SOURCE_NOT_FOUND", "message": "虚拟挂载未启用"})
+			return false
+		}
+		if s.auth == nil || s.isAdmin(c) {
+			return true
+		}
+		if act == auth.ActionRead && s.checkVFSAccessible(s.currentUsername(c), s.isAdmin(c)) {
+			return true
+		}
+		// 对写/删操作，具体路径权限在 checkPathAccess 按挂载路由判定
+		if act == auth.ActionWrite || act == auth.ActionDelete {
+			return true
+		}
+		c.JSON(http.StatusForbidden, gin.H{"code": "FORBIDDEN", "message": "权限不足：无权访问虚拟挂载源"})
+		return false
+	}
 	if s.auth == nil {
 		return true
 	}
@@ -53,6 +114,42 @@ func (s *Server) checkSourceAccess(c *gin.Context, sourceID string, act auth.Act
 // checkPathAccess 检查当前登录用户是否对 sourceID 的 targetPath 拥有 act 权限。
 // 未通过时直接写入 403 响应并返回 false。
 func (s *Server) checkPathAccess(c *gin.Context, sourceID, targetPath string, act auth.Action) bool {
+	if sourceID == mount.VirtualSourceID {
+		if s.mounts == nil {
+			c.JSON(http.StatusNotFound, gin.H{"code": "SOURCE_NOT_FOUND", "message": "虚拟挂载未启用"})
+			return false
+		}
+		route, err := s.mounts.Resolve(targetPath)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"code": "INVALID_PATH", "message": "非法路径"})
+			return false
+		}
+		if route == nil {
+			// 落在虚拟中间导航目录：仅允许 Read，写/删由驱动或此处拦截
+			if act == auth.ActionRead {
+				if !s.checkAPITokenSource(c, mount.VirtualSourceID, act) {
+					return false
+				}
+				if s.checkVFSAccessible(s.currentUsername(c), s.isAdmin(c)) {
+					return true
+				}
+				c.JSON(http.StatusForbidden, gin.H{"code": "FORBIDDEN", "message": "权限不足：无权浏览虚拟挂载目录"})
+				return false
+			}
+			c.JSON(http.StatusBadRequest, gin.H{"code": "VIRTUAL_NAV_DIR", "message": mount.ErrVirtualNavDir.Error()})
+			return false
+		}
+		if route.Mount.Readonly && (act == auth.ActionWrite || act == auth.ActionDelete) {
+			c.JSON(http.StatusForbidden, gin.H{"code": "MOUNT_READONLY", "message": mount.ErrMountReadOnly.Error()})
+			return false
+		}
+		sourceID = route.Mount.SourceID
+		targetPath = route.PhysicalPath
+	}
+
+	if !s.checkAPITokenSource(c, sourceID, act) {
+		return false
+	}
 	if s.auth == nil {
 		return true
 	}

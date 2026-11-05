@@ -4,7 +4,7 @@
 // - 网格视图：大图卡片式浏览（280x280 动态缩放缩略图 + loading="lazy"），解决大图目录卡顿和带宽浪费
 import { computed, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { View, Download, Link, EditPen, Share, Grid, Menu as MenuIcon } from '@element-plus/icons-vue'
+import { View, Download, Link, EditPen, Share, Grid, Menu as MenuIcon, CopyDocument } from '@element-plus/icons-vue'
 import { useBrowseStore } from '../stores/browse'
 import { presign, downloadUrl, renameEntry, thumbUrl } from '../api'
 import { fmtSize, fmtTime, fileIcon, parentOf, joinPath } from '../utils/format'
@@ -12,6 +12,7 @@ import { previewKind, isThumbable } from '../utils/preview'
 import type { Entry } from '../api/types'
 import ShareDialog from './ShareDialog.vue'
 import type { ShareTarget } from './ShareDialog.vue'
+import TransferDialog from './TransferDialog.vue'
 
 const emit = defineEmits<{
   navigate: [source: string, path: string]
@@ -36,12 +37,24 @@ watch(() => [browse.source, browse.path], () => {
 })
 
 const canWrite = computed(() => browse.canWrite)
-const canDelete = computed(() => browse.canDelete)
 const canShare = computed(() => browse.canShare)
-const showSelection = computed(() => canWrite.value || canDelete.value)
+const showSelection = computed(() => true)
+const hasAnyWritableSource = computed(() =>
+  browse.sources.some(s => s.capabilities.write && (!s.access || s.access.actions.includes('write'))),
+)
 
 const shareDialogRef = ref<InstanceType<typeof ShareDialog>>()
 const shareVisible = ref(false)
+const transferDialogRef = ref<InstanceType<typeof TransferDialog>>()
+const transferVisible = ref(false)
+
+function onTransferSingle(e: Entry, mode: 'copy' | 'move') {
+  transferDialogRef.value?.open({
+    mode,
+    sourceId: browse.source,
+    paths: [e.path],
+  })
+}
 
 /** 分享入口：文件行 → 弹创建对话框 */
 function onShare(e: Entry) {
@@ -218,13 +231,14 @@ function rowKey(row: ParentRow) {
         </template>
       </el-table-column>
 
-      <el-table-column label="操作" width="260">
+      <el-table-column label="操作" width="300">
         <template #default="{ row }">
           <template v-if="!row.__parent">
             <el-button v-if="isPreviewable(row)" link type="primary" :icon="View" @click="emit('preview', row)">预览</el-button>
             <el-button link type="primary" :icon="Download" tag="a" :href="downloadUrl(browse.source, row.path)">下载</el-button>
             <el-button v-if="browse.canPresign && !row.is_dir" link type="primary" :icon="Link" @click="openPresign(row)">直链</el-button>
             <el-button v-if="canShare" link type="primary" :icon="Share" @click="onShare(row)">分享</el-button>
+            <el-button v-if="hasAnyWritableSource" link type="primary" :icon="CopyDocument" @click="onTransferSingle(row, 'copy')">复制</el-button>
             <el-button v-if="canWrite" link type="primary" :icon="EditPen" @click="onRename(row)">重命名</el-button>
           </template>
         </template>
@@ -287,6 +301,7 @@ function rowKey(row: ParentRow) {
     </div>
 
     <ShareDialog ref="shareDialogRef" v-model="shareVisible" />
+    <TransferDialog ref="transferDialogRef" v-model="transferVisible" />
   </div>
 </template>
 

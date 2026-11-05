@@ -47,6 +47,18 @@ type Source struct {
 // Driver 返回底层驱动实例（仅限服务端内部使用）。
 func (s *Source) Driver() driver.FSDriver { return s.drv }
 
+// NewVirtual 构造一个由运行时驱动直接支撑的虚拟文件源（如 M4.3 "@vfs" 虚拟挂载树）。
+func NewVirtual(id, name, typ string, drv driver.FSDriver) *Source {
+	return &Source{
+		ID:     id,
+		Name:   name,
+		Type:   typ,
+		Config: map[string]any{},
+		Caps:   drv.Capabilities(),
+		drv:    drv,
+	}
+}
+
 // Sanitized 返回给前端的视图：config 中的敏感字段（key/secret/password）打码。
 func (s *Source) Sanitized() *Source {
 	out := *s

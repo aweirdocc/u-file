@@ -21,6 +21,7 @@ export const useBrowseStore = defineStore('browse', {
     error: '',
     /** 非空 = 搜索模式，值为查询词 */
     searchQuery: '',
+    searchMode: 'filename' as 'filename' | 'fulltext',
     searchHits: [] as SearchHit[],
     searchLoading: false,
     /** 勾选的路径 */
@@ -187,13 +188,14 @@ export const useBrowseStore = defineStore('browse', {
       this.pageStack.pop()
       await this.loadEntries()
     },
-    async runSearch(q: string) {
+    async runSearch(q: string, mode?: 'filename' | 'fulltext') {
+      if (mode) this.searchMode = mode
       this.searchQuery = q
       this.searchHits = []
       if (!q) return
       this.searchLoading = true
       try {
-        const r = await api.search(q, 100)
+        const r = await api.search(q, 100, this.searchMode)
         this.searchHits = r.hits
       } finally {
         this.searchLoading = false

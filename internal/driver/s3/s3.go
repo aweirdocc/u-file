@@ -390,6 +390,78 @@ func (d *S3) Rename(ctx context.Context, from, to string) error {
 	return nil
 }
 
+// Copy 同一 S3 源（同 Bucket）内服务端直接拷贝对象或目录前缀（实现 driver.Copier）。
+func (d *S3) Copy(ctx context.Context, from, to string) error {
+	srcRel, err := driver.CleanPath(from)
+	if err != nil {
+		return err
+	}
+	dstRel, err := driver.CleanPath(to)
+	if err != nil {
+		return err
+	}
+	if srcRel == "" || dstRel == "" || srcRel == dstRel {
+		return driver.ErrInvalidPath
+	}
+	if !d.credent {
+		return errors.New("s3: 未配置凭据，不支持写操作")
+	}
+	if strings.HasPrefix(dstRel, srcRel+"/") {
+		return driver.ErrInvalidPath
+	}
+	srcKey := d.prefix + srcRel
+	dstKey := d.prefix + dstRel
+
+	if _, err := d.client.CopyObject(ctx, &s3.CopyObjectInput{
+		Bucket:     aws.String(d.bucket),
+		Key:        aws.String(dstKey),
+		CopySource: aws.String(url.PathEscape(d.bucket + "/" + srcKey)),
+	}); err != nil {
+		if !isNotFound(err) {
+			return fmt.Errorf("s3: CopyObject: %w", err)
+		}
+		return d.copyPrefix(ctx, srcKey+"/", dstKey+"/")
+	}
+	return nil
+}
+
+func (d *S3) copyPrefix(ctx context.Context, srcPrefix, dstPrefix string) error {
+	var after string
+	copiedAny := false
+	for {
+		in := &s3.ListObjectsV2Input{
+			Bucket: aws.String(d.bucket), Prefix: aws.String(srcPrefix), MaxKeys: aws.Int32(1000),
+		}
+		if after != "" {
+			in.ContinuationToken = aws.String(after)
+		}
+		out, err := d.client.ListObjectsV2(ctx, in)
+		if err != nil {
+			return fmt.Errorf("s3: ListObjectsV2: %w", err)
+		}
+		for _, o := range out.Contents {
+			key := aws.ToString(o.Key)
+			newKey := dstPrefix + strings.TrimPrefix(key, srcPrefix)
+			if _, err := d.client.CopyObject(ctx, &s3.CopyObjectInput{
+				Bucket:     aws.String(d.bucket),
+				Key:        aws.String(newKey),
+				CopySource: aws.String(url.PathEscape(d.bucket + "/" + key)),
+			}); err != nil {
+				return fmt.Errorf("s3: CopyObject: %w", err)
+			}
+			copiedAny = true
+		}
+		if !aws.ToBool(out.IsTruncated) {
+			break
+		}
+		after = aws.ToString(out.NextContinuationToken)
+	}
+	if !copiedAny {
+		return driver.ErrNotFound
+	}
+	return nil
+}
+
 func (d *S3) renamePrefix(ctx context.Context, srcPrefix, dstPrefix string) error {
 	var after string
 	for {
