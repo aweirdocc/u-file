@@ -30,10 +30,23 @@ func newMemDriver() *memDriver {
 }
 
 func (m *memDriver) addDir(dir string, entries ...driver.Entry) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.tree[dir] = entries
 }
 
-func (m *memDriver) fail(dir string, err error) { m.failOn[dir] = err }
+func (m *memDriver) fail(dir string, err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.failOn[dir] = err
+}
+
+// callCount 读取驱动被调用次数（与后台同步 goroutine 并发安全）。
+func (m *memDriver) callCount(dir string) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.calls[dir]
+}
 
 func (m *memDriver) Scheme() string { return "mem" }
 func (m *memDriver) Capabilities() driver.Capabilities {
@@ -48,8 +61,8 @@ func (m *memDriver) Open(ctx context.Context, p string, opt driver.OpenOptions) 
 
 func (m *memDriver) List(ctx context.Context, dir string, opt driver.ListOptions) (*driver.ListResult, error) {
 	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.calls[dir]++
-	m.mu.Unlock()
 	if err, ok := m.failOn[dir]; ok {
 		return nil, err
 	}
@@ -82,25 +95,25 @@ func TestListCacheHitAndRefresh(t *testing.T) {
 	}
 	// 命中缓存：驱动不再被调用
 	c.List(context.Background(), "s1", d, "", driver.ListOptions{}, false)
-	if d.calls[""] != 1 {
-		t.Fatalf("第二次应命中缓存，驱动调用 %d 次", d.calls[""])
+	if d.callCount("") != 1 {
+		t.Fatalf("第二次应命中缓存，驱动调用 %d 次", d.callCount(""))
 	}
 	// refresh=1 绕过缓存
 	c.List(context.Background(), "s1", d, "", driver.ListOptions{}, true)
-	if d.calls[""] != 2 {
-		t.Fatalf("refresh 应回源，驱动调用 %d 次", d.calls[""])
+	if d.callCount("") != 2 {
+		t.Fatalf("refresh 应回源，驱动调用 %d 次", d.callCount(""))
 	}
 	// TTL 过期回源
 	c.dirs["s1\x00"].At = time.Now().Add(-2 * time.Minute)
 	c.List(context.Background(), "s1", d, "", driver.ListOptions{}, false)
-	if d.calls[""] != 3 {
+	if d.callCount("") != 3 {
 		t.Fatal("TTL 过期应回源")
 	}
 	// 游标请求永不缓存
-	d2calls := d.calls[""]
+	d2calls := d.callCount("")
 	c.List(context.Background(), "s1", d, "", driver.ListOptions{Cursor: "tok"}, false)
 	c.List(context.Background(), "s1", d, "", driver.ListOptions{Cursor: "tok"}, false)
-	if d.calls[""] != d2calls+2 {
+	if d.callCount("") != d2calls+2 {
 		t.Fatal("游标请求应每次回源")
 	}
 }
@@ -122,9 +135,9 @@ func TestSyncAllWalksTree(t *testing.T) {
 		t.Fatalf("应遍历 3 个目录: %+v", st)
 	}
 	// 缓存已预热：后续 List 不再打驱动
-	before := d.calls["docs/a"]
+	before := d.callCount("docs/a")
 	c.List(context.Background(), "s1", d, "docs/a", driver.ListOptions{}, false)
-	if d.calls["docs/a"] != before {
+	if d.callCount("docs/a") != before {
 		t.Fatal("同步后的目录应命中缓存")
 	}
 }
@@ -191,12 +204,12 @@ func TestSnapshotPersistence(t *testing.T) {
 	}
 	// 新实例加载快照 → 直接命中
 	c2 := New(dir, Config{SyncEvery: -1, Snapshot: true}, ids, src)
-	before := d.calls[""]
+	before := d.callCount("")
 	res, err := c2.List(context.Background(), "s1", d, "", driver.ListOptions{}, false)
 	if err != nil || len(res.Entries) != 1 {
 		t.Fatalf("快照恢复后 List: %v", err)
 	}
-	if d.calls[""] != before {
+	if d.callCount("") != before {
 		t.Fatal("快照恢复后应命中缓存不再回源")
 	}
 }
@@ -225,13 +238,13 @@ func TestStartStopLoop(t *testing.T) {
 	// 等待至少两轮同步
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		if d.calls[""] >= 2 {
+		if d.callCount("") >= 2 {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if d.calls[""] < 2 {
-		t.Fatalf("后台循环未运行: 调用 %d 次", d.calls[""])
+	if d.callCount("") < 2 {
+		t.Fatalf("后台循环未运行: 调用 %d 次", d.callCount(""))
 	}
 	c.Stop()
 }

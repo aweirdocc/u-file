@@ -1211,19 +1211,15 @@ func (m *Manager) Subscribe(username string, isAdmin bool) (<-chan []*Task, func
 	return ch, unsubscribe
 }
 
+// broadcast 全程持有 subMu：非阻塞发送与退订的 close 在同一临界区内串行，
+// 杜绝向已关闭 channel 发送的 panic（调用方须未持有 m.mu，本方法会取 m.mu.RLock）。
 func (m *Manager) broadcast() {
 	m.subMu.Lock()
+	defer m.subMu.Unlock()
 	if len(m.subs) == 0 {
-		m.subMu.Unlock()
 		return
 	}
-	targets := make(map[chan []*Task]string, len(m.subs))
 	for ch, filter := range m.subs {
-		targets[ch] = filter
-	}
-	m.subMu.Unlock()
-
-	for ch, filter := range targets {
 		snap := m.List(filter, filter == "")
 		select {
 		case ch <- snap:
