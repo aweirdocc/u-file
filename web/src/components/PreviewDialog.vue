@@ -184,6 +184,16 @@ watch(visible, async (v) => {
   font: 12.5px/1.6 Consolas, Menlo, monospace;
   white-space: pre-wrap; word-break: break-all;
 }
-.md { padding: 20px 26px; width: 100%; background: var(--el-bg-color); overflow: auto; }
+.md {
+  min-width: 0;
+  align-self: stretch;
+  padding: 20px 26px;
+  width: 100%;
+  background: var(--el-bg-color);
+  overflow-wrap: anywhere;
+}
+.md :deep(img) { max-width: 100%; height: auto; }
+.md :deep(table) { display: block; max-width: 100%; overflow-x: auto; }
+.md :deep(.task-item) { list-style: none; margin-left: -1.25em; }
 .fallback { padding: 40px; text-align: center; color: var(--el-text-color-secondary); }
 </style>
