@@ -6,10 +6,13 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/crypto/bcrypt"
 )
 
 func newTestStore(t *testing.T) *Store {
 	t.Helper()
+	bcryptCost = bcrypt.MinCost // 测试加速，生产为 DefaultCost
 	s, err := NewStore(t.TempDir(), []byte("test-secret-32-bytes-xxxxxxxxxxxx!"))
 	if err != nil {
 		t.Fatal(err)
@@ -148,7 +151,7 @@ func TestLoginRateLimit(t *testing.T) {
 }
 
 func TestLimiterBackoffGrows(t *testing.T) {
-	l := newLimiter()
+	l := newLimiter(5)
 	k := "k"
 	// 第一次进入惩罚：base=5s
 	for i := 0; i < 5; i++ {

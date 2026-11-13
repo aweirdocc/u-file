@@ -132,9 +132,12 @@ func main() {
 	}
 
 	// 事件 Webhook（M4.2）：data/webhooks.json
-	whMgr, err := webhook.NewManager((*dataDir), webhook.Config{})
+	whMgr, err := webhook.NewManager((*dataDir), webhook.Config{AllowPrivateTargets: cfg.Webhook.AllowPrivateTargets})
 	if err != nil {
 		log.Fatalf("初始化 Webhook 管理器失败: %v", err)
+	}
+	if cfg.Webhook.AllowPrivateTargets {
+		log.Printf("[warn] webhook.allow_private_targets 已开启：Webhook 可投递到内网地址，请确认仅受信管理员可配置")
 	}
 
 	// 索引缓存（M1）：目录 TTL 缓存 + 后台定时全量同步 + 快照持久化。
@@ -215,6 +218,8 @@ func main() {
 		api.WithWebhooks(whMgr),
 		api.WithMounts(mntMgr),
 		api.WithFullText(ftEngine),
+		api.WithTrustedProxies(cfg.Server.TrustedProxies),
+		api.WithSecureCookie(cfg.Server.SecureCookie),
 	)
 	if err != nil {
 		log.Fatalf("初始化失败: %v", err)

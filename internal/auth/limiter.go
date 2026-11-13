@@ -22,12 +22,12 @@ type failRecord struct {
 	until    time.Time // 惩罚截止；零值=未惩罚
 }
 
-func newLimiter() *limiter {
+func newLimiter(allowed int) *limiter {
 	return &limiter{
 		fails:   map[string]*failRecord{},
 		base:    5 * time.Second,
 		max:     15 * time.Minute,
-		allowed: 5,
+		allowed: allowed,
 	}
 }
 

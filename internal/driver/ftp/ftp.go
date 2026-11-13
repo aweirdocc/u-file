@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/textproto"
 	"path"
 	"strings"
@@ -49,6 +50,9 @@ func New(cfg map[string]any) (driver.FSDriver, error) {
 	root := strings.Trim(driver.Str(cfg, "root", ""), "/")
 	if root != "" {
 		root += "/"
+	}
+	if driver.Bool(cfg, "tls", false) && driver.Bool(cfg, "insecure_tls", false) {
+		log.Printf("[warn] FTPS 源 %s 已关闭证书校验（insecure_tls=true），连接易遭中间人攻击", host)
 	}
 	return &FTP{
 		host:  host,

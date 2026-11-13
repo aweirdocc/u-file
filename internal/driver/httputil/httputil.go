@@ -4,6 +4,7 @@ package httputil
 import (
 	"crypto/tls"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -44,6 +45,7 @@ func NewClient(opt Options) (*http.Client, error) {
 		tr.Proxy = http.ProxyURL(u)
 	}
 	if opt.InsecureTLS {
+		log.Printf("[warn] 已为 HTTP 驱动关闭 TLS 证书校验（insecure_tls=true），连接易遭中间人窃听凭据与数据，仅建议用于受信内网自签证书")
 		tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec // 用户显式开启
 	}
 	return &http.Client{Transport: tr}, nil

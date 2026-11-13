@@ -18,12 +18,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -115,6 +118,81 @@ type Config struct {
 	MaxRetries     int           // 最大重试次数（默认 5）
 	RetryBaseDelay time.Duration // 初始退避延迟（默认 2s，测试可设为 10ms）
 	HTTPTimeout    time.Duration // 单次 HTTP 投递超时（默认 10s）
+	// AllowPrivateTargets 是否允许投递到回环/私有/链路本地等内网地址。
+	// 默认 false（防 SSRF：禁止访问 127.0.0.1、10/8、172.16/12、192.168/16、
+	// 169.254/16 云元数据等）；内网自建接收端需显式开启。
+	AllowPrivateTargets bool
+}
+
+// ErrBlockedTarget 投递目标解析到被禁止的内网地址。
+var ErrBlockedTarget = errors.New("webhook: 目标地址解析为内网/保留地址，已按 SSRF 防护策略拒绝（如需投递到内网请开启 webhook.allow_private_targets）")
+
+// blockedPrefixes 除标准库可识别的回环/私有/链路本地之外的额外保留网段。
+var blockedPrefixes = []netip.Prefix{
+	netip.MustParsePrefix("0.0.0.0/8"),     // 本网络
+	netip.MustParsePrefix("100.64.0.0/10"), // CGNAT 共享地址
+	netip.MustParsePrefix("192.0.0.0/24"),  // IETF 协议分配
+	netip.MustParsePrefix("198.18.0.0/15"), // 基准测试
+	netip.MustParsePrefix("240.0.0.0/4"),   // 保留
+	netip.MustParsePrefix("64:ff9b::/96"),  // NAT64（可映射到内网 IPv4）
+}
+
+// IsBlockedIP 判断 IP 是否属于 SSRF 防护应拒绝的地址。
+func IsBlockedIP(ip net.IP) bool {
+	if ip == nil {
+		return true
+	}
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsUnspecified() ||
+		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
+		ip.IsInterfaceLocalMulticast() || ip.IsMulticast() {
+		return true
+	}
+	addr, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return true
+	}
+	addr = addr.Unmap()
+	for _, p := range blockedPrefixes {
+		if p.Contains(addr) {
+			return true
+		}
+	}
+	return false
+}
+
+// newHTTPClient 构造投递用 HTTP 客户端：
+//   - 在建连（Dialer.Control）阶段校验最终连接的 IP，可同时防御 DNS 重绑定；
+//   - 不跟随重定向（防止 302 跳转到内网）；
+//   - 不走环境代理（否则校验的是代理地址而非真实目标）。
+func newHTTPClient(cfg Config) *http.Client {
+	dialer := &net.Dialer{Timeout: cfg.HTTPTimeout, KeepAlive: 30 * time.Second}
+	if !cfg.AllowPrivateTargets {
+		dialer.Control = func(network, address string, _ syscall.RawConn) error {
+			host, _, err := net.SplitHostPort(address)
+			if err != nil {
+				return ErrBlockedTarget
+			}
+			if IsBlockedIP(net.ParseIP(host)) {
+				return ErrBlockedTarget
+			}
+			return nil
+		}
+	}
+	tr := &http.Transport{
+		Proxy:                 nil,
+		DialContext:           dialer.DialContext,
+		TLSHandshakeTimeout:   cfg.HTTPTimeout,
+		ResponseHeaderTimeout: cfg.HTTPTimeout,
+		MaxIdleConns:          16,
+		IdleConnTimeout:       90 * time.Second,
+	}
+	return &http.Client{
+		Timeout:   cfg.HTTPTimeout,
+		Transport: tr,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 }
 
 type deliveryJob struct {
@@ -152,7 +230,7 @@ func NewManager(dataDir string, cfg Config) (*Manager, error) {
 	m := &Manager{
 		file:      filepath.Join(dataDir, "webhooks.json"),
 		cfg:       cfg,
-		client:    &http.Client{Timeout: cfg.HTTPTimeout},
+		client:    newHTTPClient(cfg),
 		endpoints: map[string]*Endpoint{},
 		queue:     make(chan deliveryJob, 512),
 		stopCh:    make(chan struct{}),

@@ -66,7 +66,7 @@ func TestM4EndToEndAPI(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	whMgr, err := webhook.NewManager(dataDir, webhook.Config{})
+	whMgr, err := webhook.NewManager(dataDir, webhook.Config{AllowPrivateTargets: true})
 	if err != nil {
 		t.Fatal(err)
 	}

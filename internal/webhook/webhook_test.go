@@ -34,6 +34,7 @@ func TestWebhookDeliverySignatureAndRetry(t *testing.T) {
 		MaxRetries:     4,
 		RetryBaseDelay: 10 * time.Millisecond,
 		HTTPTimeout:    2 * time.Second,
+		AllowPrivateTargets: true, // httptest 监听 127.0.0.1
 	})
 	if err != nil {
 		t.Fatal(err)
