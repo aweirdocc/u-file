@@ -11,10 +11,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
+	"net"
 	"net/textproto"
 	"path"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jlaffaye/ftp"
@@ -50,6 +53,9 @@ func New(cfg map[string]any) (driver.FSDriver, error) {
 	if root != "" {
 		root += "/"
 	}
+	if driver.Bool(cfg, "tls", false) && driver.Bool(cfg, "insecure_tls", false) {
+		log.Printf("[warn] FTPS 源 %s 已关闭证书校验（insecure_tls=true），连接易遭中间人攻击", host)
+	}
 	return &FTP{
 		host:  host,
 		port:  port,
@@ -70,7 +76,19 @@ func (d *FTP) Capabilities() driver.Capabilities {
 // dial 建立新连接。
 func (d *FTP) dial(ctx context.Context) (*ftp.ServerConn, error) {
 	addr := fmt.Sprintf("%s:%d", d.host, d.port)
-	opts := []ftp.DialOption{ftp.DialWithTimeout(15 * time.Second)}
+	// 自定义拨号：TCP 连接 + banner/USER/PASS/TYPE 交换整体限时，
+	// 防“可连但不响应”的服务器使拨号 goroutine 永久阻塞
+	handshake := &stuckDeadlineConn{}
+	dialFunc := func(network, address string) (net.Conn, error) {
+		c, err := (&net.Dialer{Timeout: dialTimeout}).DialContext(ctx, network, address)
+		if err != nil {
+			return nil, err
+		}
+		handshake.Conn = c
+		_ = handshake.SetDeadline(time.Now().Add(dialTimeout))
+		return handshake, nil
+	}
+	opts := []ftp.DialOption{ftp.DialWithDialFunc(dialFunc)}
 	if d.tls {
 		opts = append(opts, ftp.DialWithTLS(implicitTLSConfig(d.insec)))
 	}
@@ -93,57 +111,88 @@ func (d *FTP) dial(ctx context.Context) (*ftp.ServerConn, error) {
 		}
 		// 二进制模式（避免 ASCII 传输破坏二进制文件）
 		_ = c.Type(ftp.TransferTypeBinary)
+		handshake.release() // 握手完成，解除限时
 		ch <- res{c: c}
 	}()
 	select {
 	case <-ctx.Done():
+		// 后台拨号仍在继续：成功建连的连接由回收 goroutine 关闭，避免孤儿连接泄漏
+		go func() {
+			if r := <-ch; r.c != nil {
+				_ = r.c.Quit()
+			}
+		}()
 		return nil, ctx.Err()
 	case r := <-ch:
 		return r.c, r.err
 	}
 }
 
-// getConn 取（必要时重拨）连接。FTP 连接可能被服务端闲置断开，出错重试一次。
-func (d *FTP) getConn(ctx context.Context) (*ftp.ServerConn, error) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if d.conn != nil {
-		// 用 NOOP 探活
-		if err := d.conn.NoOp(); err == nil {
-			return d.conn, nil
-		}
-		d.conn.Quit()
-		d.conn = nil
-	}
-	c, err := d.dial(ctx)
-	if err != nil {
-		return nil, err
-	}
-	d.conn = c
-	return c, nil
+// 控制连接操作的兜底上限：远端挂起时强制断连，避免调用方永久阻塞。
+const (
+	opTimeout    = 2 * time.Minute
+	probeTimeout = 30 * time.Second
+)
+
+// dialTimeout TCP 连接 + 握手（banner/登录/TYPE）整体限时；var 仅为测试可覆盖。
+var dialTimeout = 15 * time.Second
+
+// stuckDeadlineConn 握手期限连接：release 后所有 SetDeadline 请求归零，
+// 使库在传输收尾时设置的临时 deadline 不再受握手时限影响（库不暴露底层连接，
+// 只能在自定义拨号层包一层）。
+type stuckDeadlineConn struct {
+	net.Conn
+	released atomic.Bool
 }
 
-// withConn 执行单次操作，连接级错误时重拨重试一次。
-func (d *FTP) withConn(ctx context.Context, fn func(c *ftp.ServerConn) error) error {
-	c, err := d.getConn(ctx)
+func (c *stuckDeadlineConn) release() { c.released.Store(true) }
+
+func (c *stuckDeadlineConn) SetDeadline(t time.Time) error {
+	if c.released.Load() {
+		t = time.Time{}
+	}
+	return c.Conn.SetDeadline(t)
+}
+
+// withConn 串行执行一次控制连接操作，探活失败或连接级错误时重拨重试一次。
+// 持锁贯穿全程：FTP 控制连接不可并发复用，命令交叉会串话。timeout 为单次
+// 操作的兜底上限；时长由数据量决定的上传传 0（仅感知 ctx 取消）。
+func (d *FTP) withConn(ctx context.Context, timeout time.Duration, fn func(c *ftp.ServerConn) error) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if c := d.conn; c != nil {
+		if err := driver.RunWatchdog(ctx, probeTimeout, func() { go c.Quit() }, c.NoOp); err == nil {
+			if err := d.runOpLocked(ctx, c, timeout, fn); !isConnErr(err) && !isAbort(err) {
+				return err
+			}
+		}
+		// 探活失败或连接已死：重拨
+		_ = c.Quit()
+		d.conn = nil
+	}
+	c2, err := d.dial(ctx)
 	if err != nil {
 		return err
 	}
-	if err := fn(c); err != nil && isConnErr(err) {
-		// 连接已断：重拨再来一次
-		d.mu.Lock()
-		if d.conn == c {
-			d.conn.Quit()
-			d.conn = nil
-		}
-		d.mu.Unlock()
-		c2, err2 := d.getConn(ctx)
-		if err2 != nil {
-			return err
-		}
-		return fn(c2)
+	d.conn = c2
+	return d.runOpLocked(ctx, c2, timeout, fn)
+}
+
+// runOpLocked 执行单次操作；连接级错误或看门狗中止时丢弃池内引用（调用方必须持有 d.mu）。
+func (d *FTP) runOpLocked(ctx context.Context, c *ftp.ServerConn, timeout time.Duration, fn func(c *ftp.ServerConn) error) error {
+	err := driver.RunWatchdog(ctx, timeout, func() { go c.Quit() }, func() error { return fn(c) })
+	if err != nil && (isConnErr(err) || isAbort(err)) && d.conn == c {
+		_ = c.Quit()
+		d.conn = nil
 	}
 	return err
+}
+
+// isAbort 判断错误是否来自看门狗中止（连接已被 kill 作废，需重拨）。
+func isAbort(err error) bool {
+	var ae *driver.AbortError
+	return errors.As(err, &ae)
 }
 
 func isConnErr(err error) bool {
@@ -174,7 +223,7 @@ func (d *FTP) List(ctx context.Context, dir string, opt driver.ListOptions) (*dr
 	}
 	rel, _ := driver.CleanPath(dir)
 	var entries []driver.Entry
-	err = d.withConn(ctx, func(c *ftp.ServerConn) error {
+	err = d.withConn(ctx, opTimeout, func(c *ftp.ServerConn) error {
 		list, err := c.List(full)
 		if err != nil {
 			return err
@@ -222,7 +271,7 @@ func (d *FTP) Stat(ctx context.Context, p string) (*driver.Entry, error) {
 		return nil, err
 	}
 	var entry *driver.Entry
-	err = d.withConn(ctx, func(c *ftp.ServerConn) error {
+	err = d.withConn(ctx, opTimeout, func(c *ftp.ServerConn) error {
 		// MLST 优先（RFC 3659），退化用 List 父目录
 		if e, err := c.GetEntry(full); err == nil && e != nil {
 			entry = toEntry(rel, e)
@@ -276,13 +325,20 @@ func (d *FTP) Open(ctx context.Context, p string, opt driver.OpenOptions) (io.Re
 	if err != nil {
 		return nil, err
 	}
-	r, err := conn.RetrFrom(full, uint64(max0(opt.Offset)))
-	if err != nil {
-		conn.Quit()
-		if isNotFound(err) {
+	// RETR 命令交换阶段（数据连接建立）受看门狗保护；之后的数据流读取
+	// 由 pooledReadCloser 生命周期管理（挂起的下载随请求 ctx/连接关闭终止）
+	var r *ftp.Response
+	werr := driver.RunWatchdog(ctx, probeTimeout, func() { go conn.Quit() }, func() error {
+		var err error
+		r, err = conn.RetrFrom(full, uint64(max0(opt.Offset)))
+		return err
+	})
+	if werr != nil {
+		go conn.Quit()
+		if isNotFound(werr) {
 			return nil, driver.ErrNotFound
 		}
-		return nil, fmt.Errorf("ftp: Retr %s: %w", full, err)
+		return nil, fmt.Errorf("ftp: Retr %s: %w", full, werr)
 	}
 	rc = &pooledReadCloser{ReadCloser: r, conn: conn}
 	return rc, nil
@@ -314,12 +370,19 @@ func (d *FTP) Upload(ctx context.Context, p string, r io.Reader, size int64) err
 	if err != nil {
 		return err
 	}
-	// 父目录确保存在
+	// 父目录确保存在（走控制连接池）
 	if err := d.ensureDir(ctx, path.Dir(full)); err != nil {
 		return err
 	}
-	return d.withConn(ctx, func(c *ftp.ServerConn) error {
-		return c.Stor(full, r)
+	// 传输走专用连接：大文件传输时长不定，不长期占用控制连接池，
+	// ctx 取消时由看门狗强制断连终止传输
+	conn, err := d.dial(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { go conn.Quit() }()
+	return driver.RunWatchdog(ctx, 0, func() { go conn.Quit() }, func() error {
+		return conn.Stor(full, r)
 	})
 }
 
@@ -336,12 +399,12 @@ func (d *FTP) Delete(ctx context.Context, p string) error {
 		return err
 	}
 	// 先试文件
-	ferr := d.withConn(ctx, func(c *ftp.ServerConn) error { return c.Delete(full) })
+	ferr := d.withConn(ctx, opTimeout, func(c *ftp.ServerConn) error { return c.Delete(full) })
 	if ferr == nil {
 		return nil
 	}
 	// 再按目录递归删
-	derr := d.withConn(ctx, func(c *ftp.ServerConn) error { return c.RemoveDirRecur(full) })
+	derr := d.withConn(ctx, opTimeout, func(c *ftp.ServerConn) error { return c.RemoveDirRecur(full) })
 	if derr == nil {
 		return nil
 	}
@@ -365,23 +428,28 @@ func (d *FTP) ensureDir(ctx context.Context, full string) error {
 	if full == "" || full == "/" {
 		return nil
 	}
-	return d.withConn(ctx, func(c *ftp.ServerConn) error {
-		parts := strings.Split(strings.TrimPrefix(full, "/"), "/")
-		cur := ""
-		for _, seg := range parts {
-			if seg == "" {
-				continue
-			}
-			cur += "/" + seg
-			if err := c.MakeDir(cur); err != nil {
-				// 已存在则忽略
-				if _, lerr := c.List(cur); lerr != nil {
-					return fmt.Errorf("ftp: MKD %s: %w", cur, err)
-				}
+	return d.withConn(ctx, opTimeout, func(c *ftp.ServerConn) error {
+		return ensureDirOn(c, full)
+	})
+}
+
+// ensureDirOn 在指定连接上逐级创建目录（已存在忽略）。
+func ensureDirOn(c *ftp.ServerConn, full string) error {
+	parts := strings.Split(strings.TrimPrefix(full, "/"), "/")
+	cur := ""
+	for _, seg := range parts {
+		if seg == "" {
+			continue
+		}
+		cur += "/" + seg
+		if err := c.MakeDir(cur); err != nil {
+			// 已存在则忽略
+			if _, lerr := c.List(cur); lerr != nil {
+				return fmt.Errorf("ftp: MKD %s: %w", cur, err)
 			}
 		}
-		return nil
-	})
+	}
+	return nil
 }
 
 func (d *FTP) Rename(ctx context.Context, from, to string) error {
@@ -407,7 +475,7 @@ func (d *FTP) Rename(ctx context.Context, from, to string) error {
 	if err := d.ensureDir(ctx, path.Dir(dst)); err != nil {
 		return err
 	}
-	return d.withConn(ctx, func(c *ftp.ServerConn) error { return c.Rename(src, dst) })
+	return d.withConn(ctx, opTimeout, func(c *ftp.ServerConn) error { return c.Rename(src, dst) })
 }
 
 func isNotFound(err error) bool {

@@ -196,6 +196,7 @@ func (s *Server) issueGrant(c *gin.Context, token string) {
 		Path:     "/api/v1/s/" + token + "/",
 		MaxAge:   int(share.GrantTTL().Seconds()),
 		HttpOnly: true,
+		Secure:   s.cookieSecure(c),
 		SameSite: http.SameSiteLaxMode,
 	})
 }

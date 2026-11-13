@@ -128,16 +128,47 @@ func loadKeyBytes(s string) ([]byte, error) {
 
 func pemContains(b []byte) bool { return strings.Contains(string(b), "-----BEGIN") }
 
+// 控制通道操作的兜底上限：远端挂起时强制断连，避免调用方永久阻塞。
+const (
+	opTimeout    = 2 * time.Minute
+	probeTimeout = 30 * time.Second
+)
+
+// runOp 取客户端并带看门狗执行一次操作。pkg/sftp 客户端本身并发安全，
+// 故不加驱动级串行；超时/取消时关闭共享客户端（整体作废，其余在途操作
+// 会一次性报错，下次操作探活失败自动重拨）。
+func (d *SFTP) runOp(ctx context.Context, timeout time.Duration, fn func(c *sftp.Client) error) error {
+	cli, err := d.getClient(ctx)
+	if err != nil {
+		return err
+	}
+	err = driver.RunWatchdog(ctx, timeout, func() { _ = cli.Close() }, func() error { return fn(cli) })
+	if err != nil && (isAbort(err) || isConnErr(err)) {
+		// 连接已作废：丢弃池内引用
+		d.mu.Lock()
+		if d.client == cli {
+			_ = cli.Close()
+			d.client = nil
+		}
+		d.mu.Unlock()
+	}
+	return err
+}
+
 // getClient 取（必要时重拨）SFTP 客户端。
 func (d *SFTP) getClient(ctx context.Context) (*sftp.Client, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.client != nil {
-		// 探活
-		if _, err := d.client.Stat("/"); err == nil {
-			return d.client, nil
+		// 探活（受看门狗保护：远端挂起时强制断连，不阻塞后续操作）
+		cli := d.client
+		if err := driver.RunWatchdog(ctx, probeTimeout, func() { _ = cli.Close() }, func() error {
+			_, err := cli.Stat("/")
+			return err
+		}); err == nil {
+			return cli, nil
 		}
-		d.client.Close()
+		_ = cli.Close()
 		d.client = nil
 	}
 	addr := net.JoinHostPort(d.host, fmt.Sprint(d.port))
@@ -157,21 +188,38 @@ func (d *SFTP) getClient(ctx context.Context) (*sftp.Client, error) {
 	}
 	ch := make(chan res, 1)
 	go func() {
-		conn, err := ssh.Dial("tcp", addr, cfg)
+		// 自定义握手限时：ssh.Dial 的 Timeout 只覆盖 TCP 连接，
+		// 版本交换/KEX/认证无期限，静默服务器会永久阻塞
+		tcp, err := net.DialTimeout("tcp", addr, cfg.Timeout)
 		if err != nil {
 			ch <- res{e: fmt.Errorf("sftp: SSH 连接失败: %w", err)}
 			return
 		}
-		c, err := sftp.NewClient(conn)
+		_ = tcp.SetDeadline(time.Now().Add(cfg.Timeout))
+		conn, chans, reqs, err := ssh.NewClientConn(tcp, addr, cfg)
 		if err != nil {
-			conn.Close()
+			_ = tcp.Close()
+			ch <- res{e: fmt.Errorf("sftp: SSH 连接失败: %w", err)}
+			return
+		}
+		client := ssh.NewClient(conn, chans, reqs)
+		c, err := sftp.NewClient(client)
+		if err != nil {
+			client.Close()
 			ch <- res{e: fmt.Errorf("sftp: 建立子系统失败: %w", err)}
 			return
 		}
+		_ = tcp.SetDeadline(time.Time{}) // 握手完成，解除限时（后续操作由看门狗兜底）
 		ch <- res{c: c}
 	}()
 	select {
 	case <-ctx.Done():
+		// 后台拨号仍在继续：成功建连的客户端由回收 goroutine 关闭，避免孤儿连接泄漏
+		go func() {
+			if r := <-ch; r.c != nil {
+				_ = r.c.Close()
+			}
+		}()
 		return nil, ctx.Err()
 	case r := <-ch:
 		if r.e != nil {
@@ -222,11 +270,12 @@ func (d *SFTP) List(ctx context.Context, dir string, opt driver.ListOptions) (*d
 		return nil, err
 	}
 	rel, _ := driver.CleanPath(dir)
-	cli, err := d.getClient(ctx)
-	if err != nil {
-		return nil, err
-	}
-	infos, err := cli.ReadDir(full)
+	var infos []os.FileInfo
+	err = d.runOp(ctx, opTimeout, func(c *sftp.Client) error {
+		var err error
+		infos, err = c.ReadDir(full)
+		return err
+	})
 	if err != nil {
 		if isNotFound(err) {
 			return nil, driver.ErrNotFound
@@ -262,11 +311,12 @@ func (d *SFTP) Stat(ctx context.Context, p string) (*driver.Entry, error) {
 	if err != nil {
 		return nil, err
 	}
-	cli, err := d.getClient(ctx)
-	if err != nil {
-		return nil, err
-	}
-	info, err := cli.Stat(full)
+	var info os.FileInfo
+	err = d.runOp(ctx, opTimeout, func(c *sftp.Client) error {
+		var err error
+		info, err = c.Stat(full)
+		return err
+	})
 	if err != nil {
 		if isNotFound(err) {
 			return nil, driver.ErrNotFound
@@ -290,11 +340,12 @@ func (d *SFTP) Open(ctx context.Context, p string, opt driver.OpenOptions) (io.R
 	if rel, _ := driver.CleanPath(p); rel == "" {
 		return nil, driver.ErrInvalidPath
 	}
-	cli, err := d.getClient(ctx)
-	if err != nil {
-		return nil, err
-	}
-	f, err := cli.Open(full)
+	var f *sftp.File
+	err = d.runOp(ctx, opTimeout, func(c *sftp.Client) error {
+		var err error
+		f, err = c.Open(full)
+		return err
+	})
 	if err != nil {
 		if isNotFound(err) {
 			return nil, driver.ErrNotFound
@@ -317,20 +368,30 @@ func (d *SFTP) Upload(ctx context.Context, p string, r io.Reader, size int64) er
 	if err != nil {
 		return err
 	}
-	cli, err := d.getClient(ctx)
-	if err != nil {
+	var f *sftp.File
+	err = d.runOp(ctx, opTimeout, func(c *sftp.Client) error {
+		if err := ensureDir(c, path.Dir(full)); err != nil {
+			return err
+		}
+		var err error
+		f, err = c.Create(full) // 覆盖写
 		return err
-	}
-	if err := ensureDir(cli, path.Dir(full)); err != nil {
-		return err
-	}
-	f, err := cli.Create(full) // 覆盖写
+	})
 	if err != nil {
 		return fmt.Errorf("sftp: Create %s: %w", full, err)
 	}
-	defer f.Close()
-	if _, err := io.Copy(f, r); err != nil {
-		return fmt.Errorf("sftp: 写入 %s: %w", full, err)
+	// 数据流传输不设墙上时钟（时长由数据量决定），仅感知 ctx 取消；
+	// 取消时关闭共享客户端终止写入（其余在途操作会报错并自动重拨）
+	werr := driver.RunWatchdog(ctx, 0, func() { _ = f.Close() }, func() error {
+		_, err := io.Copy(f, r)
+		return err
+	})
+	cerr := f.Close()
+	if werr != nil {
+		return fmt.Errorf("sftp: 写入 %s: %w", full, werr)
+	}
+	if cerr != nil {
+		return fmt.Errorf("sftp: 关闭 %s: %w", full, cerr)
 	}
 	return nil
 }
@@ -347,11 +408,12 @@ func (d *SFTP) Delete(ctx context.Context, p string) error {
 	if err != nil {
 		return err
 	}
-	cli, err := d.getClient(ctx)
-	if err != nil {
+	var info os.FileInfo
+	err = d.runOp(ctx, opTimeout, func(c *sftp.Client) error {
+		var err error
+		info, err = c.Stat(full)
 		return err
-	}
-	info, err := cli.Stat(full)
+	})
 	if err != nil {
 		if isNotFound(err) {
 			return driver.ErrNotFound
@@ -359,9 +421,10 @@ func (d *SFTP) Delete(ctx context.Context, p string) error {
 		return err
 	}
 	if info.IsDir() {
-		return removeAll(cli, full)
+		return d.runOp(ctx, opTimeout, func(c *sftp.Client) error { return removeAll(c, full) })
 	}
-	if err := cli.Remove(full); err != nil {
+	err = d.runOp(ctx, opTimeout, func(c *sftp.Client) error { return c.Remove(full) })
+	if err != nil {
 		return fmt.Errorf("sftp: Remove %s: %w", full, err)
 	}
 	return nil
@@ -372,11 +435,7 @@ func (d *SFTP) Mkdir(ctx context.Context, p string) error {
 	if err != nil {
 		return err
 	}
-	cli, err := d.getClient(ctx)
-	if err != nil {
-		return err
-	}
-	return ensureDir(cli, full)
+	return d.runOp(ctx, opTimeout, func(c *sftp.Client) error { return ensureDir(c, full) })
 }
 
 func (d *SFTP) Rename(ctx context.Context, from, to string) error {
@@ -399,21 +458,20 @@ func (d *SFTP) Rename(ctx context.Context, from, to string) error {
 	if err != nil {
 		return err
 	}
-	cli, err := d.getClient(ctx)
-	if err != nil {
-		return err
-	}
-	if err := ensureDir(cli, path.Dir(dst)); err != nil {
-		return err
-	}
-	if err := cli.PosixRename(src, dst); err != nil {
-		// PosixRename 不被部分服务器支持时退化为 stat+rename（不可覆盖语义）
-		if _, serr := cli.Stat(dst); serr == nil {
-			return fmt.Errorf("sftp: 目标已存在且服务器不支持覆盖重命名: %w", err)
+	err = d.runOp(ctx, opTimeout, func(c *sftp.Client) error {
+		if err := ensureDir(c, path.Dir(dst)); err != nil {
+			return err
 		}
-		return fmt.Errorf("sftp: Rename %s→%s: %w", src, dst, err)
-	}
-	return nil
+		if err := c.PosixRename(src, dst); err != nil {
+			// PosixRename 不被部分服务器支持时退化为 stat+rename（不可覆盖语义）
+			if _, serr := c.Stat(dst); serr == nil {
+				return fmt.Errorf("sftp: 目标已存在且服务器不支持覆盖重命名: %w", err)
+			}
+			return fmt.Errorf("sftp: Rename %s→%s: %w", src, dst, err)
+		}
+		return nil
+	})
+	return err
 }
 
 // ensureDir 逐级创建目录（已存在忽略）。
@@ -462,6 +520,24 @@ func removeAll(cli *sftp.Client, full string) error {
 		}
 	}
 	return cli.RemoveDirectory(full)
+}
+
+// isAbort 判断错误是否来自看门狗中止（共享客户端已被关闭，需重拨）。
+func isAbort(err error) bool {
+	var ae *driver.AbortError
+	return errors.As(err, &ae)
+}
+
+// isConnErr 判断是否连接级错误（传输通道已断，需重拨）。
+func isConnErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "connection") ||
+		strings.Contains(msg, "EOF") ||
+		strings.Contains(msg, "broken pipe") ||
+		strings.Contains(msg, "reset")
 }
 
 func isNotFound(err error) bool {

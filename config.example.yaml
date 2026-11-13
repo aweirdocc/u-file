@@ -5,6 +5,16 @@
 #   - 数据目录可用 -data 参数指定（默认 ./data），含 users.json / audit.log / index.json。
 server:
   port: 8080
+  # 受信反向代理 IP/CIDR（部署在 Nginx / Traefik / Caddy 后时填写，如 ["127.0.0.1", "10.0.0.0/8"]）。
+  # 默认留空：不采信 X-Forwarded-For，防止攻击者伪造请求头绕过登录限速与污染审计日志。
+  # trusted_proxies: []
+  # 强制 Cookie 携带 Secure 属性（TLS 在反向代理层终止时请设为 true）。
+  # secure_cookie: false
+
+# webhook:
+#   # 默认禁止 Webhook 投递到回环/私有/云元数据等内网地址（防 SSRF）。
+#   # 若接收端位于受信任内网，可显式开启：
+#   allow_private_targets: false
 
 sources:
   # 本地磁盘（开箱即用）

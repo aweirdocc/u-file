@@ -101,6 +101,9 @@ type Server struct {
 	fulltext  *fulltext.Engine   // M4.3 全文检索引擎
 	webFS     fs.FS              // 前端静态资源（Vue 构建产物）
 	indexHTML []byte             // 入口 index.html（启动时读入）
+
+	trustedProxies []string // 受信反向代理（CIDR/IP）；为空 = 不信任任何 X-Forwarded-For
+	secureCookie   bool     // 强制 Cookie 带 Secure（TLS 在反向代理终止时开启）
 }
 
 // New 构造 API 服务。authStore/auditLog 可为 nil（无鉴权模式）；
@@ -113,7 +116,12 @@ func New(cfgSources *source.Manager, authStore *auth.Store, auditLog *audit.Log,
 			opt(s)
 		}
 	}
-	s.engine.Use(gin.Logger(), gin.Recovery())
+	// 默认不信任任何代理头：否则攻击者可伪造 X-Forwarded-For 绕过登录/提取码限速、污染审计 IP。
+	// 部署在 Nginx/Traefik 后时通过 server.trusted_proxies 显式声明代理地址。
+	if err := s.engine.SetTrustedProxies(s.trustedProxies); err != nil {
+		return nil, fmt.Errorf("api: trusted_proxies 配置非法: %w", err)
+	}
+	s.engine.Use(gin.LoggerWithFormatter(accessLogFormatter), gin.Recovery())
 
 	s.engine.GET("/healthz", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
@@ -396,6 +404,7 @@ func (s *Server) issueSession(c *gin.Context, tok string, role auth.Role) {
 		Path:     "/",
 		MaxAge:   int((24 * time.Hour).Seconds()),
 		HttpOnly: true,
+		Secure:   s.cookieSecure(c),
 		SameSite: http.SameSiteLaxMode,
 	})
 	c.Header("X-Auth-Token", tok) // 前端读取后走 Authorization 头
@@ -440,7 +449,7 @@ func (s *Server) resetPassword(c *gin.Context) {
 
 // logout 清除会话 cookie（JWT 本身无状态，服务端不维护黑名单；到期自然失效）。
 func (s *Server) logout(c *gin.Context) {
-	http.SetCookie(c.Writer, &http.Cookie{Name: "ufile_token", Value: "", Path: "/", MaxAge: -1, HttpOnly: true})
+	http.SetCookie(c.Writer, &http.Cookie{Name: "ufile_token", Value: "", Path: "/", MaxAge: -1, HttpOnly: true, Secure: s.cookieSecure(c), SameSite: http.SameSiteLaxMode})
 	s.auditAction(c, "auth.logout", nil)
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
@@ -567,10 +576,10 @@ func (s *Server) removeSource(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
-// exportSources 导出源配置为 JSON 附件。?redact=1 时凭据打码（模板分享场景），
-// 默认全量（含明文凭据，响应头已标注提示）。
+// exportSources 导出源配置为 JSON 附件。默认凭据打码（安全默认值）；
+// 仅显式 ?redact=0 时导出明文凭据（文件名与审计日志均会标注）。
 func (s *Server) exportSources(c *gin.Context) {
-	redact := c.Query("redact") == "1"
+	redact := c.Query("redact") != "0"
 	doc := s.sources.Export(redact)
 	raw, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {
@@ -581,6 +590,8 @@ func (s *Server) exportSources(c *gin.Context) {
 	if !redact {
 		name = "ufile-sources-full.json" // 含明文凭据，文件名本身即提醒
 	}
+	s.auditAction(c, "source.export", gin.H{"redacted": redact, "count": len(doc.Sources)})
+	c.Header("Cache-Control", "no-store")
 	c.Header("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": name}))
 	c.Data(http.StatusOK, "application/json; charset=utf-8", raw)
 }
@@ -761,7 +772,14 @@ func (s *Server) serveInline(c *gin.Context, src *source.Source, path, dispositi
 		s.fail(c, err)
 		return
 	}
-	defer rc.Close()
+	rs := wrapReadSeeker(c.Request.Context(), src.Driver(), path, rc, st.Size)
+	// 统一经由包装器关闭：reopenSeeker 在 Seek 重开后持有的是新流，
+	// 仅 rc.Close() 会漏关重开流（Range 断点续传场景的连接泄漏）。
+	defer func() {
+		if cl, ok := rs.(io.Closer); ok {
+			_ = cl.Close()
+		}
+	}()
 
 	name := sanitizeFilename(st.Name)
 	mt := mediaTypeByExt(name)
@@ -774,7 +792,7 @@ func (s *Server) serveInline(c *gin.Context, src *source.Source, path, dispositi
 		c.Header("Content-Security-Policy", "default-src 'none'; img-src 'self' data:; media-src 'self'; style-src 'unsafe-inline'")
 		c.Header("X-Content-Type-Options", "nosniff")
 	}
-	http.ServeContent(c.Writer, c.Request, name, st.ModTime, wrapReadSeeker(c.Request.Context(), src.Driver(), path, rc, st.Size))
+	http.ServeContent(c.Writer, c.Request, name, st.ModTime, rs)
 }
 
 func (s *Server) download(c *gin.Context) {

@@ -14,6 +14,16 @@ import (
 
 type Server struct {
 	Port int `yaml:"port"`
+	// TrustedProxies 受信反向代理 IP/CIDR；为空时不采信 X-Forwarded-For（防伪造 IP 绕过限速）。
+	TrustedProxies []string `yaml:"trusted_proxies"`
+	// SecureCookie 强制 Cookie 带 Secure（HTTPS 在反向代理终止时开启）。
+	SecureCookie bool `yaml:"secure_cookie"`
+}
+
+// Webhook 事件投递安全配置。
+type Webhook struct {
+	// AllowPrivateTargets 允许投递到内网/回环地址（默认 false，防 SSRF）。
+	AllowPrivateTargets bool `yaml:"allow_private_targets"`
 }
 
 type Source struct {
@@ -36,6 +46,7 @@ type Seed = source.Seed
 
 type Config struct {
 	Server  Server   `yaml:"server"`
+	Webhook Webhook  `yaml:"webhook"`
 	Sources []Source `yaml:"sources"`
 }
 

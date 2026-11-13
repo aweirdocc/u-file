@@ -7,7 +7,7 @@ import { downloadHref } from '../utils/format'
 const visible = defineModel<boolean>({ default: false })
 const emit = defineEmits<{ download: [redact: boolean] }>()
 
-const redact = ref(false)
+const redact = ref(true) // 安全默认：脱敏导出；取消勾选才导出明文凭据
 const msg = ref('')
 
 watch(visible, (v) => { if (v) msg.value = '' })

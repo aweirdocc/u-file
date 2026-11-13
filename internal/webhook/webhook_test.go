@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -13,6 +14,7 @@ import (
 
 func TestWebhookDeliverySignatureAndRetry(t *testing.T) {
 	var attempts atomic.Int32
+	var mu sync.Mutex // 保护以下捕获变量（handler goroutine 写、测试主体读）
 	var gotSig, gotEvent string
 	var gotBody []byte
 
@@ -23,9 +25,11 @@ func TestWebhookDeliverySignatureAndRetry(t *testing.T) {
 			w.WriteHeader(http.StatusBadGateway)
 			return
 		}
+		mu.Lock()
 		gotSig = r.Header.Get("X-UFile-Signature")
 		gotEvent = r.Header.Get("X-UFile-Event")
 		gotBody, _ = io.ReadAll(r.Body)
+		mu.Unlock()
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer srv.Close()
@@ -34,6 +38,7 @@ func TestWebhookDeliverySignatureAndRetry(t *testing.T) {
 		MaxRetries:     4,
 		RetryBaseDelay: 10 * time.Millisecond,
 		HTTPTimeout:    2 * time.Second,
+		AllowPrivateTargets: true, // httptest 监听 127.0.0.1
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -68,16 +73,19 @@ func TestWebhookDeliverySignatureAndRetry(t *testing.T) {
 	if attempts.Load() != 3 {
 		t.Fatalf("expected 3 attempts (2 retries), got %d", attempts.Load())
 	}
-	if gotEvent != EventFileUploaded {
-		t.Fatalf("expected event %s, got %s", EventFileUploaded, gotEvent)
+	mu.Lock()
+	sig, event, body := gotSig, gotEvent, gotBody
+	mu.Unlock()
+	if event != EventFileUploaded {
+		t.Fatalf("expected event %s, got %s", EventFileUploaded, event)
 	}
-	wantSig := "sha256=" + SignPayload(gotBody, "my-super-secret")
-	if gotSig != wantSig {
-		t.Fatalf("signature mismatch: got %s, want %s", gotSig, wantSig)
+	wantSig := "sha256=" + SignPayload(body, "my-super-secret")
+	if sig != wantSig {
+		t.Fatalf("signature mismatch: got %s, want %s", sig, wantSig)
 	}
 
 	var ev Event
-	if err := json.Unmarshal(gotBody, &ev); err != nil || ev.SourceID != "oss-prod" {
+	if err := json.Unmarshal(body, &ev); err != nil || ev.SourceID != "oss-prod" {
 		t.Fatalf("unexpected payload: %v %+v", err, ev)
 	}
 

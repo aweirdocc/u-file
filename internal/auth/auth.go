@@ -84,7 +84,8 @@ type Store struct {
 	users  map[string]*user
 	order  []string
 
-	limiter *limiter
+	limiter      *limiter // 按 用户名+IP 维度
+	limiterUser  *limiter // 仅按用户名维度（防轮换伪造 IP 的分布式爆破）
 
 	loginKey *rsa.PrivateKey // 登录信封私钥（data/login.key）
 	pubPEM   []byte          // 对应公钥（SPKI PEM，供前端加密）
@@ -107,7 +108,8 @@ func NewStore(dataDir string, secret []byte) (*Store, error) {
 		file:     filepath.Join(dataDir, "users.json"),
 		secret:   secret,
 		users:    map[string]*user{},
-		limiter:  newLimiter(),
+		limiter:     newLimiter(5),
+		limiterUser: newLimiter(20), // 用户名维度阈值放宽，降低恶意锁号影响
 		loginKey: loginKey,
 		pubPEM:   pubPEM,
 	}
@@ -180,7 +182,7 @@ func (s *Store) ChangePassword(name, newPassword string) error {
 	if !ok {
 		return ErrBadCredentials
 	}
-	hash, err := bcrypt.GenerateFromPassword([]byte(newPassword), bcrypt.DefaultCost)
+	hash, err := bcrypt.GenerateFromPassword([]byte(newPassword), bcryptCost)
 	if err != nil {
 		return err
 	}
@@ -189,6 +191,9 @@ func (s *Store) ChangePassword(name, newPassword string) error {
 	u.UpdatedAt = time.Now()
 	return s.saveLocked()
 }
+
+// bcryptCost 密码哈希成本；测试中降为 MinCost 以加速（生产保持 DefaultCost）。
+var bcryptCost = bcrypt.DefaultCost
 
 // saveLocked 调用方必须已持有写锁。
 func (s *Store) saveLocked() error {
@@ -221,10 +226,17 @@ func (s *Store) List() []storedUser {
 }
 
 // Login 校验用户名密码，签发 JWT。key 为限速维度（用户名+来源 IP），
-// 连续失败会触发指数退避限速。
+// 连续失败会触发指数退避限速。另有仅按用户名的第二维度：即使攻击者
+// 轮换伪造来源 IP，对同一账号的在线爆破也会被聚合限速拦住（阈值放宽以
+// 降低恶意锁号影响）。
 func (s *Store) Login(name, password, key string) (token string, role Role, err error) {
-	if !s.limiter.Allow(key) {
-		return "", "", fmt.Errorf("%w（还需等待 %s）", ErrRateLimited, s.limiter.RetryAfter(key).Round(time.Second))
+	userKey := "user:" + name
+	if !s.limiter.Allow(key) || !s.limiterUser.Allow(userKey) {
+		wait := s.limiter.RetryAfter(key)
+		if w2 := s.limiterUser.RetryAfter(userKey); w2 > wait {
+			wait = w2
+		}
+		return "", "", fmt.Errorf("%w（还需等待 %s）", ErrRateLimited, wait.Round(time.Second))
 	}
 	s.mu.RLock()
 	u, ok := s.users[name]
@@ -243,16 +255,19 @@ func (s *Store) Login(name, password, key string) (token string, role Role, err 
 			[]byte("$2a$10$7EqJtq98hPqEX7fNZaFWoOhi5B0X8fF2W6bQ6z1dKU9v3aZz8yE9O"), // "dummy"
 			[]byte(password))
 		s.limiter.Fail(key)
+		s.limiterUser.Fail(userKey)
 		return "", "", ErrBadCredentials
 	}
 	if bcrypt.CompareHashAndPassword(hash, []byte(password)) != nil {
 		s.limiter.Fail(key)
+		s.limiterUser.Fail(userKey)
 		return "", "", ErrBadCredentials
 	}
 	if disabled {
 		return "", "", ErrUserDisabled
 	}
 	s.limiter.Reset(key)
+	s.limiterUser.Reset(userKey)
 	tok, err := s.sign(name, role2)
 	if err != nil {
 		return "", "", err
