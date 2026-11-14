@@ -111,6 +111,13 @@ func NewManager(dataDir string, seed []Seed, cipher *crypt.Cipher) (*Manager, er
 	if err := os.MkdirAll(dataDir, 0o755); err != nil {
 		return nil, err
 	}
+	// 配置文件是否存在决定是否允许用 config.yaml 播种。空数组是用户有意
+	// 删除全部源后的有效持久化状态，不能因 len(sources) == 0 被重新播种。
+	_, statErr := os.Stat(filepath.Join(dataDir, "sources.json"))
+	if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
+		return nil, fmt.Errorf("source: 检查持久化文件失败: %w", statErr)
+	}
+	hasPersistedSources := statErr == nil
 	m := &Manager{
 		sources:       map[string]*Source{},
 		file:          filepath.Join(dataDir, "sources.json"),
@@ -120,7 +127,7 @@ func NewManager(dataDir string, seed []Seed, cipher *crypt.Cipher) (*Manager, er
 	if err := m.load(); err != nil {
 		return nil, err
 	}
-	if len(m.sources) == 0 && len(seed) > 0 {
+	if !hasPersistedSources && len(m.sources) == 0 && len(seed) > 0 {
 		for _, s := range seed {
 			if _, err := m.Add(s.ID, s.Name, s.Type, s.Config); err != nil {
 				return nil, fmt.Errorf("seed source %q: %w", s.ID, err)

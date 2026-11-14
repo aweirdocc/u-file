@@ -153,9 +153,13 @@ export const useBrowseStore = defineStore('browse', {
     },
     async loadSources() {
       try {
-        this.sources = await api.listFiles === undefined ? [] : await api.listSources()
+        this.sources = await api.listSources()
+        if (this.source && !this.sources.some(x => x.id === this.source)) {
+          this.fromRoute('', '')
+        }
       } catch (e) {
         this.sources = []
+        this.fromRoute('', '')
         throw e
       }
     },

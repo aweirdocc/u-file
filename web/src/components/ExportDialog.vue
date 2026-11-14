@@ -5,7 +5,6 @@ import { exportUrl, exportText } from '../api'
 import { downloadHref } from '../utils/format'
 
 const visible = defineModel<boolean>({ default: false })
-const emit = defineEmits<{ download: [redact: boolean] }>()
 
 const redact = ref(true) // 安全默认：脱敏导出；取消勾选才导出明文凭据
 const msg = ref('')
@@ -15,7 +14,6 @@ watch(visible, (v) => { if (v) msg.value = '' })
 function onDownload() {
   downloadHref(exportUrl(redact.value))
   msg.value = '已开始下载。'
-  emit('download', redact.value)
 }
 
 async function onCopy() {

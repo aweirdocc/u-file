@@ -40,11 +40,14 @@ async function onDelete(id: string) {
   } catch {
     return
   }
+  const wasCurrent = browse.source === id
   try {
     await removeSource(id)
+    // 先同步本地列表再改变路由。否则删除最后一个源时，路由守卫会从旧列表中
+    // 重新选中刚删掉的源，界面无法回到空状态。
+    await browse.loadSources()
     ElMessage.success('已删除')
-    if (browse.source === id) emit('select', '', '')
-    else await browse.loadSources()
+    if (wasCurrent) emit('select', '', '')
   } catch (e: any) {
     ElMessage.error('删除失败：' + e.message)
   }

@@ -53,6 +53,7 @@ router.beforeEach(async (to) => {
       const pfx = first.access?.path_prefix || ''
       return pfx ? `/${first.id}/${pfx}` : `/${first.id}`
     }
+    browse.fromRoute('', '')
     return
   }
 

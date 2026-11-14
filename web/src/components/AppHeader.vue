@@ -4,7 +4,6 @@ import { useRouter, useRoute } from 'vue-router'
 import { Search, User, UserFilled, SwitchButton, Plus, Download, Upload as UploadIcon, Share, Connection } from '@element-plus/icons-vue'
 import { useAuthStore } from '../stores/auth'
 import { useBrowseStore } from '../stores/browse'
-import { downloadHref, exportUrl } from '../api/exportHelpers'
 import SourceDialog from './SourceDialog.vue'
 import ExportDialog from './ExportDialog.vue'
 import ImportDialog from './ImportDialog.vue'
@@ -33,6 +32,12 @@ function openAddSource() {
   sourceDialogVisible.value = true
 }
 
+function onSourceSaved(id: string) {
+  if (!route.meta.standalone && !browse.source) {
+    router.push(`/${id}`)
+  }
+}
+
 async function onLogout() {
   browse.reset()
   await auth.logout()
@@ -41,10 +46,6 @@ async function onLogout() {
 function onExport() { browse.exportDialogVisible = true }
 function onImport() { browse.importDialogVisible = true }
 
-// 导出下载（带 token 的 JSON 附件由后端 Content-Disposition 决定；此处原生导航走 cookie）
-function doExportDownload(redact: boolean) {
-  downloadHref(exportUrl(redact))
-}
 </script>
 
 <template>
@@ -137,8 +138,8 @@ function doExportDownload(redact: boolean) {
     </div>
   </el-header>
 
-  <SourceDialog v-model="sourceDialogVisible" />
-  <ExportDialog v-model="browse.exportDialogVisible" @download="doExportDownload" />
+  <SourceDialog v-model="sourceDialogVisible" @saved="onSourceSaved" />
+  <ExportDialog v-model="browse.exportDialogVisible" />
   <ImportDialog v-model="browse.importDialogVisible" />
 </template>
 

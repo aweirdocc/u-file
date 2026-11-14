@@ -157,6 +157,27 @@ func TestPersistenceAndSeedOnce(t *testing.T) {
 	}
 }
 
+func TestRemovingLastSourcePersistsEmptyConfiguration(t *testing.T) {
+	dir := t.TempDir()
+	seeds := []Seed{seedLocal("only")}
+	m1, err := NewManager(dir, seeds, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m1.Remove("only"); err != nil {
+		t.Fatal(err)
+	}
+
+	// sources.json 的空数组代表用户明确清空配置，重启时不能再次导入 seed。
+	m2, err := NewManager(dir, seeds, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := m2.List(); len(got) != 0 {
+		t.Fatalf("删除最后一个源后重启应保持空列表，得到 %v", got)
+	}
+}
+
 func TestLoadSkipsBrokenSource(t *testing.T) {
 	dir := t.TempDir()
 	file := filepath.Join(dir, "sources.json")
