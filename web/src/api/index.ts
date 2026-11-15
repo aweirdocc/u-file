@@ -9,6 +9,7 @@ import type {
   APITokenInfo, CreateAPITokenInput, CreateAPITokenResponse,
   WebhookEndpoint, UpsertWebhookInput, WebhookTestResult,
   MountItem, UpsertMountInput, FullTextStatus,
+  AuditListResponse,
 } from './types'
 
 const enc = encodeURIComponent
@@ -230,5 +231,17 @@ export const deleteMount = (id: string) => del<{ ok: boolean }>(`/api/v1/mounts/
 export const getFullTextStatus = () => get<FullTextStatus>('/api/v1/fulltext/status')
 export const rebuildFullText = (sourceId = '') =>
   post<{ ok: boolean; message: string }>('/api/v1/fulltext/rebuild', { source_id: sourceId })
+
+// —— 操作审计日志 ——
+
+export function listAuditLogs(params: { limit?: number; action?: string; user?: string; q?: string } = {}) {
+  const qs = new URLSearchParams()
+  if (params.limit) qs.set('limit', String(params.limit))
+  if (params.action) qs.set('action', params.action)
+  if (params.user) qs.set('user', params.user)
+  if (params.q) qs.set('q', params.q)
+  const qstr = qs.toString()
+  return get<AuditListResponse>(qstr ? `/api/v1/audit?${qstr}` : '/api/v1/audit')
+}
 
 export type { Source, Entry }

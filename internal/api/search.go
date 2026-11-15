@@ -67,11 +67,13 @@ func (s *Server) search(c *gin.Context) {
 				break
 			}
 		}
+		s.auditAction(c, "file.search", gin.H{"query": q, "source": srcFilter, "mode": "fulltext", "count": len(out)})
 		c.JSON(http.StatusOK, gin.H{"query": q, "mode": "fulltext", "count": len(out), "hits": out})
 		return
 	}
 
 	if s.index == nil {
+		s.auditAction(c, "file.search", gin.H{"query": q, "source": srcFilter, "mode": "filename", "count": 0})
 		c.JSON(http.StatusOK, gin.H{"query": q, "mode": "filename", "count": 0, "hits": []gin.H{}})
 		return
 	}
@@ -97,5 +99,6 @@ func (s *Server) search(c *gin.Context) {
 			break
 		}
 	}
+	s.auditAction(c, "file.search", gin.H{"query": q, "source": srcFilter, "mode": "filename", "count": len(out)})
 	c.JSON(http.StatusOK, gin.H{"query": q, "mode": "filename", "count": len(out), "hits": out})
 }

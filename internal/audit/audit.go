@@ -12,11 +12,13 @@ import (
 
 // Entry 一条审计记录。
 type Entry struct {
-	Time   time.Time `json:"time"`
-	User   string    `json:"user"`
-	IP     string    `json:"ip"`
-	Action string    `json:"action"` // auth.login / source.add / source.delete / ...
-	Detail any       `json:"detail,omitempty"`
+	Time       time.Time `json:"time"`
+	User       string    `json:"user"`
+	IP         string    `json:"ip"`
+	Action     string    `json:"action"` // auth.login / source.add / source.delete / ...
+	TraceID    string    `json:"trace_id,omitempty"`
+	AgentActor string    `json:"agent_actor,omitempty"`
+	Detail     any       `json:"detail,omitempty"`
 }
 
 // Log 追加写审计日志。写失败不阻断业务（只丢审计不丢功能），
@@ -35,32 +37,51 @@ func Open(dataDir string, onErr func(error)) (*Log, error) {
 	return &Log{file: filepath.Join(dataDir, "audit.log"), onErr: onErr}, nil
 }
 
-// Record 追加一条记录（自动带时间戳兜底）。
+// Record 追加一条记录（fail-open：写失败不阻断业务，仅回调 onErr）。
 func (l *Log) Record(e Entry) {
+	if err := l.RecordStrict(e); err != nil && l.onErr != nil {
+		l.onErr(err)
+	}
+}
+
+// RecordStrict 追加一条记录并在写入失败时返回错误，供高风险操作 fail-closed 使用。
+func (l *Log) RecordStrict(e Entry) error {
 	if l == nil {
-		return
+		return nil
 	}
 	if e.Time.IsZero() {
 		e.Time = time.Now()
 	}
 	raw, err := json.Marshal(e)
 	if err != nil {
-		return
+		return err
 	}
 	raw = append(raw, '\n')
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	f, err := os.OpenFile(l.file, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
-		if l.onErr != nil {
-			l.onErr(err)
-		}
-		return
+		return err
 	}
 	defer f.Close()
-	if _, err := f.Write(raw); err != nil && l.onErr != nil {
-		l.onErr(err)
+	if _, err := f.Write(raw); err != nil {
+		return err
 	}
+	return nil
+}
+
+// CheckWritable 预检审计日志文件是否可写，供 fail-closed 写操作在执行存储变更前拦截。
+func (l *Log) CheckWritable() error {
+	if l == nil {
+		return nil
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	f, err := os.OpenFile(l.file, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	return f.Close()
 }
 
 // Read 尾读最近 n 条（倒序返回，供管理界面查看）。

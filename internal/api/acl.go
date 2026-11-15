@@ -253,6 +253,7 @@ func (s *Server) createUser(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"code": "INVALID_PARAM", "message": err.Error()})
 		return
 	}
+	s.invalidateAgentGuardPolicy()
 	s.auditAction(c, "auth.user.create", gin.H{"target": req.Username, "role": req.Role, "policies": len(req.Policies)})
 	u, _ := s.auth.Get(req.Username)
 	pols := u.Policies
@@ -302,6 +303,7 @@ func (s *Server) updateUser(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"code": "INVALID_PARAM", "message": err.Error()})
 		return
 	}
+	s.invalidateAgentGuardPolicy()
 	s.auditAction(c, "auth.user.update", gin.H{"target": target, "role": req.Role, "disabled": req.Disabled})
 	u, _ := s.auth.Get(target)
 	pols := u.Policies
@@ -333,6 +335,7 @@ func (s *Server) updateUserPolicies(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"code": "INVALID_PARAM", "message": err.Error()})
 		return
 	}
+	s.invalidateAgentGuardPolicy()
 	s.auditAction(c, "auth.user.policies", gin.H{"target": target, "count": len(req.Policies)})
 	u, _ := s.auth.Get(target)
 	pols := u.Policies

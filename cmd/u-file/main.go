@@ -212,7 +212,11 @@ func main() {
 		}
 	}
 
-	srv, err := api.New(mgr, authStore, auditLog, idxCache, shareMgr, webFS,
+	gatewaySecret := cfg.Server.GatewaySecret
+	if envSecret := os.Getenv("UFILE_GATEWAY_SECRET"); envSecret != "" {
+		gatewaySecret = envSecret
+	}
+	apiOpts := []api.Option{
 		api.WithTasks(taskMgr),
 		api.WithAPITokens(tokMgr),
 		api.WithWebhooks(whMgr),
@@ -220,7 +224,24 @@ func main() {
 		api.WithFullText(ftEngine),
 		api.WithTrustedProxies(cfg.Server.TrustedProxies),
 		api.WithSecureCookie(cfg.Server.SecureCookie),
-	)
+		api.WithGatewaySecret(gatewaySecret),
+		api.WithRequireGatewayForAPIToken(cfg.Server.RequireGatewayForToken),
+	}
+	if cfg.Server.GatewayFailClosedAudit != nil {
+		apiOpts = append(apiOpts, api.WithGatewayFailClosedAudit(*cfg.Server.GatewayFailClosedAudit))
+	}
+	agAdminSecret := cfg.Server.AgentGuardAdminSecret
+	if envAGSecret := os.Getenv("UFILE_AGENTGUARD_ADMIN_SECRET"); envAGSecret != "" {
+		agAdminSecret = envAGSecret
+	}
+	if agAdminSecret == "" {
+		agAdminSecret = gatewaySecret
+	}
+	if cfg.Server.AgentGuardAdminURL != "" {
+		apiOpts = append(apiOpts, api.WithAgentGuardSyncNotify(cfg.Server.AgentGuardAdminURL, agAdminSecret, cfg.Server.AgentGuardAppID))
+	}
+
+	srv, err := api.New(mgr, authStore, auditLog, idxCache, shareMgr, webFS, apiOpts...)
 	if err != nil {
 		log.Fatalf("初始化失败: %v", err)
 	}

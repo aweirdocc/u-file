@@ -1,0 +1,50 @@
+{
+  "version": "1",
+  "default_effect": "deny",
+  "rules": [
+    {
+      "name": "allow-workspace-writes",
+      "effect": "allow",
+      "operations": ["write"],
+      "path_patterns": [
+        "books/workspace/*",
+        "books/workspace/**",
+        "books/tmp/*",
+        "books/tmp/**"
+      ],
+      "max_bytes": 1048576,
+      "blocked_extensions": [".sh", ".bash", ".zsh", ".exe", ".bat", ".ps1"],
+      "reason": "writes allowed in books/workspace/ and books/tmp/ up to 1 MiB (non-executable)"
+    },
+    {
+      "name": "allow-books-tmp-delete",
+      "effect": "allow",
+      "operations": ["delete"],
+      "path_patterns": [
+        "books/tmp/*",
+        "books/tmp/**",
+        "books/*.tmp",
+        "books/**/*.tmp"
+      ],
+      "reason": "deletions allowed only in books/tmp/ or *.tmp within books"
+    },
+    {
+      "name": "redact-books-reads",
+      "effect": "redact",
+      "operations": ["read"],
+      "path_patterns": [
+        "books/*",
+        "books/**"
+      ],
+      "max_bytes": 524288,
+      "reason": "reads in books are scanned and redacted up to 512 KiB"
+    },
+    {
+      "name": "allow-list-and-stat",
+      "effect": "allow",
+      "operations": ["list", "stat"],
+      "path_patterns": ["*"],
+      "reason": "listing and stat metadata allowed"
+    }
+  ]
+}

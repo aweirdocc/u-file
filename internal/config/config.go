@@ -18,6 +18,18 @@ type Server struct {
 	TrustedProxies []string `yaml:"trusted_proxies"`
 	// SecureCookie 强制 Cookie 带 Secure（HTTPS 在反向代理终止时开启）。
 	SecureCookie bool `yaml:"secure_cookie"`
+	// GatewaySecret AgentGuard 网关 HMAC-SHA256 签名密钥（亦可通过环境变量 UFILE_GATEWAY_SECRET 注入）。
+	GatewaySecret string `yaml:"gateway_secret"`
+	// RequireGatewayForToken 强制所有 uft_ API Token 请求必须通过已认证网关进入。
+	RequireGatewayForToken bool `yaml:"require_gateway_for_token"`
+	// GatewayFailClosedAudit 控制网关来源的高风险写/删操作在审计不可写时是否阻断（默认开启）。
+	GatewayFailClosedAudit *bool `yaml:"gateway_fail_closed_audit"`
+	// AgentGuardAdminURL 可选，a-guard HTTP Gateway 管理地址（如 http://127.0.0.1:8765）；配置后在源或权限变更时主动通知其同步策略。
+	AgentGuardAdminURL string `yaml:"agentguard_admin_url"`
+	// AgentGuardAdminSecret 可选，a-guard /_admin/policy/sync 的签名密钥（未填时复用 GatewaySecret，亦可通过 UFILE_AGENTGUARD_ADMIN_SECRET 注入）。
+	AgentGuardAdminSecret string `yaml:"agentguard_admin_secret"`
+	// AgentGuardAppID 可选，通知 a-guard 同步时携带的 app_id（默认 "ufile"）。
+	AgentGuardAppID string `yaml:"agentguard_app_id"`
 }
 
 // Webhook 事件投递安全配置。
