@@ -311,6 +311,7 @@ func (s *Server) createAPIToken(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"code": "INVALID_PARAM", "message": err.Error()})
 		return
 	}
+	s.invalidateAgentGuardPolicy()
 	s.auditAction(c, "apitoken.create", gin.H{"id": tok.ID, "name": tok.Name, "scopes": tok.Scopes})
 	c.JSON(http.StatusCreated, gin.H{"token": tok, "plain_token": plain})
 }
@@ -321,6 +322,7 @@ func (s *Server) revokeAPIToken(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"code": "NOT_FOUND", "message": err.Error()})
 		return
 	}
+	s.invalidateAgentGuardPolicy()
 	s.auditAction(c, "apitoken.revoke", gin.H{"id": id})
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
@@ -331,12 +333,17 @@ func (s *Server) deleteAPIToken(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"code": "NOT_FOUND", "message": err.Error()})
 		return
 	}
+	s.invalidateAgentGuardPolicy()
 	s.auditAction(c, "apitoken.delete", gin.H{"id": id})
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
 // verifyAPITokenAuth 在鉴权中间件中处理以 "uft_" 开头的开放 API Token。
 func (s *Server) verifyAPITokenAuth(c *gin.Context, rawToken string, roles []auth.Role) {
+	if s.requireGatewayForToken && !c.GetBool("gateway_verified") {
+		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"code": "GATEWAY_REQUIRED", "message": "API Token 访问必须通过已认证的 AgentGuard 网关"})
+		return
+	}
 	if s.tokens == nil {
 		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"code": "UNAUTHORIZED", "message": "未启用 API Token 功能"})
 		return
@@ -395,6 +402,7 @@ func (s *Server) verifyAPITokenAuth(c *gin.Context, rawToken string, roles []aut
 func requiredScopeForEndpoint(method, fullPath string) (apitoken.Scope, bool) {
 	switch {
 	case strings.HasPrefix(fullPath, "/api/v1/sources/:id/files"),
+		strings.HasPrefix(fullPath, "/api/v1/sources/:id/stat"),
 		strings.HasPrefix(fullPath, "/api/v1/sources/:id/download"),
 		strings.HasPrefix(fullPath, "/api/v1/sources/:id/raw"),
 		strings.HasPrefix(fullPath, "/api/v1/sources/:id/thumb"),

@@ -61,8 +61,24 @@ func (s *Server) upload(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"code": "INVALID_PARAM", "message": "缺少 file 字段"})
 		return
 	}
+	if !s.auditPrecheck(c) {
+		return
+	}
+	expectedETag := strings.TrimSpace(c.PostForm("expected_etag"))
+	if expectedETag == "" {
+		expectedETag = strings.TrimSpace(c.Query("expected_etag"))
+	}
+	ifNotExistsVal := c.PostForm("if_not_exists")
+	if ifNotExistsVal == "" {
+		ifNotExistsVal = c.Query("if_not_exists")
+	}
+	ifNotExists := ifNotExistsVal == "1" || ifNotExistsVal == "true"
+	if c.GetBool("gateway_verified") && ifNotExistsVal == "" && expectedETag == "" {
+		// 网关模式默认开启不覆盖保护，防止 stat -> write 窗口并发覆盖（若已指定 expected_etag 则走乐观锁更新）
+		ifNotExists = true
+	}
 	results := make([]gin.H, 0, len(fhs))
-	okCount, failCount := 0, 0
+	okCount, failCount, conflictCount := 0, 0, 0
 	for _, fh := range fhs {
 		name := path.Base(fh.Filename)
 		// Windows 客户端有时带完整路径，取最后一段
@@ -74,6 +90,29 @@ func (s *Server) upload(c *gin.Context) {
 			results = append(results, gin.H{"file": name, "ok": false, "error": "权限不足"})
 			failCount++
 			continue
+		}
+		if ifNotExists || expectedETag != "" {
+			st, statErr := src.Driver().Stat(c.Request.Context(), target)
+			if ifNotExists {
+				if statErr == nil {
+					results = append(results, gin.H{"file": name, "ok": false, "code": "ALREADY_EXISTS", "error": "目标文件已存在（if_not_exists）"})
+					failCount++
+					conflictCount++
+					continue
+				}
+				if !errors.Is(statErr, driver.ErrNotFound) {
+					results = append(results, gin.H{"file": name, "ok": false, "error": statErr.Error()})
+					failCount++
+					continue
+				}
+			} else if expectedETag != "" {
+				if statErr != nil || st.ETag != expectedETag {
+					results = append(results, gin.H{"file": name, "ok": false, "code": "PRECONDITION_FAILED", "error": "ETag 前置条件不匹配"})
+					failCount++
+					conflictCount++
+					continue
+				}
+			}
 		}
 		f, err := fh.Open()
 		if err != nil {
@@ -110,7 +149,9 @@ func (s *Server) upload(c *gin.Context) {
 			}(src.ID, target, name, fh.Size, src.Driver())
 		}
 	}
-	s.auditAction(c, "file.upload", gin.H{"source": src.ID, "dir": dir, "ok": okCount, "failed": failCount})
+	if !s.auditActionStrict(c, "file.upload", gin.H{"source": src.ID, "dir": dir, "ok": okCount, "failed": failCount}) {
+		return
+	}
 	// 上传后立即失效该目录缓存，浏览即时可见
 	if s.index != nil {
 		s.index.Invalidate(src.ID)
@@ -120,7 +161,11 @@ func (s *Server) upload(c *gin.Context) {
 	}
 	status := http.StatusOK
 	if okCount == 0 && failCount > 0 {
-		status = http.StatusBadGateway
+		if conflictCount == failCount {
+			status = http.StatusConflict
+		} else {
+			status = http.StatusBadGateway
+		}
 	}
 	c.JSON(status, gin.H{"ok": failCount == 0, "uploaded": okCount, "failed": failCount, "items": results})
 }
@@ -149,11 +194,16 @@ func (s *Server) mkdir(c *gin.Context) {
 	if !s.checkPathAccess(c, src.ID, req.Path, auth.ActionWrite) {
 		return
 	}
+	if !s.auditPrecheck(c) {
+		return
+	}
 	if err := w.Mkdir(c.Request.Context(), req.Path); err != nil {
 		s.fail(c, err)
 		return
 	}
-	s.auditAction(c, "file.mkdir", gin.H{"source": src.ID, "path": req.Path})
+	if !s.auditActionStrict(c, "file.mkdir", gin.H{"source": src.ID, "path": req.Path}) {
+		return
+	}
 	if s.index != nil {
 		s.index.Invalidate(src.ID)
 	}
@@ -186,6 +236,9 @@ func (s *Server) deleteEntries(c *gin.Context) {
 			return
 		}
 	}
+	if !s.auditPrecheck(c) {
+		return
+	}
 	results := make([]gin.H, 0, len(req.Paths))
 	okCount, failCount := 0, 0
 	for _, p := range req.Paths {
@@ -206,7 +259,9 @@ func (s *Server) deleteEntries(c *gin.Context) {
 			s.fulltext.RemoveDoc(src.ID, p)
 		}
 	}
-	s.auditAction(c, "file.delete", gin.H{"source": src.ID, "ok": okCount, "failed": failCount})
+	if !s.auditActionStrict(c, "file.delete", gin.H{"source": src.ID, "ok": okCount, "failed": failCount}) {
+		return
+	}
 	if s.index != nil {
 		s.index.Invalidate(src.ID)
 	}
@@ -245,11 +300,16 @@ func (s *Server) renameEntry(c *gin.Context) {
 	if !s.checkPathAccess(c, src.ID, req.To, auth.ActionWrite) {
 		return
 	}
+	if !s.auditPrecheck(c) {
+		return
+	}
 	if err := w.Rename(c.Request.Context(), req.From, req.To); err != nil {
 		s.fail(c, err)
 		return
 	}
-	s.auditAction(c, "file.rename", gin.H{"source": src.ID, "from": req.From, "to": req.To})
+	if !s.auditActionStrict(c, "file.rename", gin.H{"source": src.ID, "from": req.From, "to": req.To}) {
+		return
+	}
 	if s.index != nil {
 		s.index.Invalidate(src.ID)
 	}

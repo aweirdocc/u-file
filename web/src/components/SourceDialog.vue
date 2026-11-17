@@ -279,7 +279,11 @@ async function onSave() {
       ElMessage.success('已创建')
     }
     visible.value = false
-    await browse.loadSources()
+    if (isEdit.value && props.editId && browse.source === props.editId) {
+      await browse.refresh()
+    } else {
+      await browse.loadSources()
+    }
     emit('saved', isEdit.value ? props.editId! : form.value.id.trim())
   } catch (e: any) {
     ElMessage.error('保存失败：' + e.message)

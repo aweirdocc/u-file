@@ -12,6 +12,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -102,8 +103,19 @@ type Server struct {
 	webFS     fs.FS              // 前端静态资源（Vue 构建产物）
 	indexHTML []byte             // 入口 index.html（启动时读入）
 
-	trustedProxies []string // 受信反向代理（CIDR/IP）；为空 = 不信任任何 X-Forwarded-For
-	secureCookie   bool     // 强制 Cookie 带 Secure（TLS 在反向代理终止时开启）
+	trustedProxies         []string // 受信反向代理（CIDR/IP）；为空 = 不信任任何 X-Forwarded-For
+	secureCookie           bool     // 强制 Cookie 带 Secure（TLS 在反向代理终止时开启）
+	gatewaySecret          string   // AgentGuard 网关 HMAC-SHA256 签名密钥
+	requireGatewayForToken bool     // 强制 uft_ API Token 只能通过已认证网关访问
+	gatewayFailClosedAudit bool     // 网关高风险写/删操作在审计不可写时阻断业务
+
+	policyMu      sync.RWMutex
+	policyJSON    []byte
+	policyETag    string
+	agAdminURL    string
+	agAdminSecret string
+	agAppID       string
+	agSyncClient  *http.Client
 }
 
 // New 构造 API 服务。authStore/auditLog 可为 nil（无鉴权模式）；
@@ -121,7 +133,7 @@ func New(cfgSources *source.Manager, authStore *auth.Store, auditLog *audit.Log,
 	if err := s.engine.SetTrustedProxies(s.trustedProxies); err != nil {
 		return nil, fmt.Errorf("api: trusted_proxies 配置非法: %w", err)
 	}
-	s.engine.Use(gin.LoggerWithFormatter(accessLogFormatter), gin.Recovery())
+	s.engine.Use(gin.LoggerWithFormatter(accessLogFormatter), gin.Recovery(), s.gatewayAuthMiddleware())
 
 	s.engine.GET("/healthz", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
@@ -160,6 +172,7 @@ func New(cfgSources *source.Manager, authStore *auth.Store, auditLog *audit.Log,
 
 	// —— 浏览/下载/预览（按 ACL read 权限校验）——
 	grp.GET("/sources/:id/files", authAny, s.listFiles)
+	grp.GET("/sources/:id/stat", authAny, s.statFile)
 	grp.GET("/sources/:id/download", authAny, s.download)
 	grp.GET("/sources/:id/raw", authAny, s.raw)
 	grp.GET("/sources/:id/thumb", authAny, s.thumb)
@@ -201,6 +214,12 @@ func New(cfgSources *source.Manager, authStore *auth.Store, auditLog *audit.Log,
 
 	// —— M4 增强特性路由（传输任务中心 / 开放 API Token / Webhook / 虚拟挂载 VFS / 全文检索）——
 	s.registerM4Routes(grp, authAdmin, authAny)
+
+	// —— 审计日志查询（仅管理员）——
+	grp.GET("/audit", authAdmin, s.listAuditLogs)
+
+	// —— AgentGuard 策略导出（网关签名或管理员鉴权，支持 ETag / 304）——
+	grp.GET("/agentguard/policy", s.requireGatewayOrAdmin(), s.getAgentGuardPolicy)
 
 	// —— 前端静态资源（Vue 构建产物，web/embed.go 内嵌 dist/）——
 	if s.webFS == nil {
@@ -305,18 +324,7 @@ func (s *Server) auditActionAs(c *gin.Context, action string, detail any, overri
 	if s.audit == nil {
 		return
 	}
-	user, _ := c.Get("user")
-	name := fmt.Sprint(user)
-	if overrideUser != "" {
-		name = overrideUser
-	}
-	s.audit.Record(audit.Entry{
-		Time:   time.Now(),
-		User:   name,
-		IP:     c.ClientIP(),
-		Action: action,
-		Detail: detail,
-	})
+	s.audit.Record(s.buildAuditEntry(c, action, detail, overrideUser))
 }
 
 // —— 鉴权接口 ——
@@ -425,6 +433,7 @@ func (s *Server) deleteUser(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"code": "INVALID_PARAM", "message": err.Error()})
 		return
 	}
+	s.invalidateAgentGuardPolicy()
 	s.auditAction(c, "auth.user.delete", gin.H{"target": name})
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
@@ -543,6 +552,7 @@ func (s *Server) addSource(c *gin.Context) {
 		s.fail(c, err)
 		return
 	}
+	s.invalidateAgentGuardPolicy()
 	s.auditAction(c, "source.add", gin.H{"id": req.ID, "type": req.Type})
 	c.JSON(http.StatusCreated, src)
 }
@@ -563,6 +573,10 @@ func (s *Server) updateSource(c *gin.Context) {
 		s.fail(c, err)
 		return
 	}
+	if s.index != nil {
+		s.index.Invalidate(c.Param("id"))
+	}
+	s.invalidateAgentGuardPolicy()
 	s.auditAction(c, "source.update", gin.H{"id": c.Param("id")})
 	c.JSON(http.StatusOK, src)
 }
@@ -572,6 +586,10 @@ func (s *Server) removeSource(c *gin.Context) {
 		s.fail(c, err)
 		return
 	}
+	if s.index != nil {
+		s.index.Invalidate(c.Param("id"))
+	}
+	s.invalidateAgentGuardPolicy()
 	s.auditAction(c, "source.delete", gin.H{"id": c.Param("id")})
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
@@ -651,6 +669,10 @@ func (s *Server) importSources(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"code": "IMPORT_FAILED", "message": err.Error()})
 		return
 	}
+	if s.index != nil {
+		s.index.Invalidate("")
+	}
+	s.invalidateAgentGuardPolicy()
 	s.auditAction(c, "source.import", gin.H{"total": rep.Total, "added": rep.Added, "updated": rep.Updated, "failed": rep.Failed})
 	c.JSON(http.StatusOK, rep)
 }
@@ -708,7 +730,31 @@ func (s *Server) listFiles(c *gin.Context) {
 			NextCursor: res.NextCursor,
 		}
 	}
+	s.auditAction(c, "file.list", gin.H{"source": src.ID, "path": p})
 	c.JSON(http.StatusOK, res)
+}
+
+// statFile 查询单个文件/目录元信息，不读取内容。
+func (s *Server) statFile(c *gin.Context) {
+	src, ok := s.resolveSource(c)
+	if !ok {
+		return
+	}
+	path := c.Query("path")
+	if path == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"code": "INVALID_PARAM", "message": "缺少 path 参数"})
+		return
+	}
+	if !s.checkPathAccess(c, src.ID, path, auth.ActionRead) {
+		return
+	}
+	st, err := src.Driver().Stat(c.Request.Context(), path)
+	if err != nil {
+		s.fail(c, err)
+		return
+	}
+	s.auditAction(c, "file.stat", gin.H{"source": src.ID, "path": path})
+	c.JSON(http.StatusOK, st)
 }
 
 // syncStatus 单源同步状态。
@@ -810,18 +856,25 @@ func (s *Server) download(c *gin.Context) {
 	}
 
 	// 直链模式：显式 ?direct=1 且驱动支持预签名 → 302 跳转，省网关带宽
+	// 网关模式下严禁直链跳转，防止绕过 a-guard 内容扫描与脱敏。
 	if c.Query("direct") == "1" {
+		if c.GetBool("gateway_verified") {
+			c.JSON(http.StatusForbidden, gin.H{"code": "DIRECT_LINK_DISABLED_FOR_GATEWAY", "message": "网关模式下禁止直链跳转"})
+			return
+		}
 		if p, ok := src.Driver().(driver.Presigner); ok {
 			u, err := p.PresignGet(c.Request.Context(), path, 15*time.Minute)
 			if err != nil {
 				s.fail(c, err)
 				return
 			}
+			s.auditAction(c, "file.download", gin.H{"source": src.ID, "path": path, "direct": true})
 			c.Redirect(http.StatusFound, u)
 			return
 		}
 	}
 
+	s.auditAction(c, "file.download", gin.H{"source": src.ID, "path": path, "direct": false})
 	s.serveInline(c, src, path, "attachment")
 }
 
@@ -860,10 +913,15 @@ func (s *Server) raw(c *gin.Context) {
 		c.JSON(http.StatusUnsupportedMediaType, gin.H{"code": "NOT_PREVIEWABLE", "message": "该文件类型不支持预览"})
 		return
 	}
+	s.auditAction(c, "file.raw", gin.H{"source": src.ID, "path": path})
 	s.serveInline(c, src, path, "inline")
 }
 
 func (s *Server) presign(c *gin.Context) {
+	if c.GetBool("gateway_verified") {
+		c.JSON(http.StatusForbidden, gin.H{"code": "PRESIGN_DISABLED_FOR_GATEWAY", "message": "网关模式下禁止生成预签名直链"})
+		return
+	}
 	src, ok := s.resolveSource(c)
 	if !ok {
 		return
@@ -892,6 +950,7 @@ func (s *Server) presign(c *gin.Context) {
 		s.fail(c, err)
 		return
 	}
+	s.auditAction(c, "file.presign", gin.H{"source": src.ID, "path": path, "ttl": int(ttl.Seconds())})
 	c.JSON(http.StatusOK, gin.H{"url": u, "expires_in": int(ttl.Seconds())})
 }
 

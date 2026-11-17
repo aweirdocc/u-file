@@ -385,3 +385,20 @@ export interface FullTextStatus {
   last_indexed_at?: string
 }
 
+// —— 操作审计日志 ——
+
+export interface AuditEntry {
+  time: string
+  user: string
+  ip: string
+  action: string
+  trace_id?: string
+  agent_actor?: string
+  detail?: Record<string, unknown> | unknown
+}
+
+export interface AuditListResponse {
+  items: AuditEntry[]
+  total: number
+}
+

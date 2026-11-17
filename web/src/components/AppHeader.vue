@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
-import { Search, User, UserFilled, SwitchButton, Plus, Download, Upload as UploadIcon, Share, Connection } from '@element-plus/icons-vue'
+import { Search, User, UserFilled, SwitchButton, Plus, Download, Upload as UploadIcon, Share, Connection, Document } from '@element-plus/icons-vue'
 import { useAuthStore } from '../stores/auth'
 import { useBrowseStore } from '../stores/browse'
 import SourceDialog from './SourceDialog.vue'
@@ -89,6 +89,9 @@ function onImport() { browse.importDialogVisible = true }
               <el-dropdown-item v-if="auth.isAdmin" :icon="UserFilled" @click="router.push('/users')">
                 用户与权限管理
               </el-dropdown-item>
+              <el-dropdown-item v-if="auth.isAdmin" :icon="Document" @click="router.push('/audit')">
+                操作审计日志
+              </el-dropdown-item>
               <el-dropdown-item v-if="auth.isAdmin || auth.canShare" :icon="Share" @click="router.push('/shares')">
                 分享外链管理
               </el-dropdown-item>
@@ -118,6 +121,16 @@ function onImport() { browse.importDialogVisible = true }
         @click="router.push('/users')"
       >
         用户管理
+      </el-button>
+
+      <el-button
+        v-if="auth.isAdmin"
+        :type="route.path === '/audit' ? 'primary' : 'default'"
+        :plain="route.path === '/audit'"
+        :icon="Document"
+        @click="router.push('/audit')"
+      >
+        审计日志
       </el-button>
 
       <el-button
